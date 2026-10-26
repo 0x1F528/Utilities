@@ -1,11 +1,26 @@
 import {summarizeFolders} from './folder-status.js';
 import {StageQueue} from './stage-queue.js';
 import {pairBranches,pairState} from './branch-tree.js';
-import {$,api,post,element,ask,preferences,savePreferences} from './shared.js';
+import {$,api as request,post as send,element,ask,preferences,savePreferences} from './shared.js';
+import {getRepo,renameRepo} from './registry.js';
+import {loadSettings} from './settings-store.js';
 import {layoutGraph,colorGraph,graphSVG} from './graph-layout.js';
-const id=new URLSearchParams(location.search).get('id'),prefKey='git-repo-'+id;
+const params=new URLSearchParams(location.search),id=params.get('id'),focusPath=params.get('path')||'',historyMode=!!focusPath;
+const registered=id?getRepo(id):null,repoPath=registered?.path||'';
+const withGit=(opts={})=>({...opts,repoPath,settings:loadSettings()});
+const api=(route,opts={})=>request(route,withGit(opts));
+const post=(route,body={})=>send(route,body,repoPath,loadSettings());
+// History tabs use a separate prefs key so refs/filters never clobber the main cockpit.
+const prefKey=historyMode?'git-repo-'+id+'::history':'git-repo-'+id;
 const prefs=preferences(prefKey,{refs:null,folders:{},colors:{},filter:'changed',force:false});prefs.folders||={};prefs.colors||={};
-let summary,tagRows=[],branchRows=[],stashRows=[],commits=[],fileRows=[],selection={mode:'wip'},beforeStash=null,selectedFiles=new Set(),activeFile='',viewRevision=0,busy=false,logCursor=0,history=[],historyIndex=0;
+/** Open only when the user saved a preference, otherwise when the folder is interesting. */
+function folderPrefOpen(store,key,interesting){if(store&&Object.hasOwn(store,key))return !!store[key];return !!interesting;}
+if(historyMode){
+  document.body.classList.add('history-mode');
+  const urlRefs=params.get('refs');
+  if(urlRefs)prefs.refs=urlRefs.split(',').filter(Boolean);
+}
+let summary,tagRows=[],branchRows=[],stashRows=[],commits=[],fileRows=[],selection=historyMode?{mode:'commit',ref:''}:{mode:'wip'},beforeStash=null,selectedFiles=new Set(),activeFile='',viewRevision=0,busy=false,logCursor=0,history=[],historyIndex=0;
 let workToken=null,historyToken=null,activeDiffToken=null,lastHistoryCheck=0,refreshTask=null;
 const stageOverrides=new Map();
 const stageQueue=new StageQueue({
@@ -14,15 +29,40 @@ const stageQueue=new StageQueue({
   onState:()=>updateStageControls(),
   onError:error=>{stageOverrides.clear();workToken=null;feedback('Staging failed: '+error.message,true);}
 });
-const route=op=>`${id}/${op}`,remember=()=>savePreferences(prefKey,prefs);
+const route=op=>`${id}/${op}`;
+function syncHistoryUrl(){
+  if(!historyMode||!id)return;
+  const q=new URLSearchParams({id,path:focusPath});
+  if(prefs.refs?.length)q.set('refs',prefs.refs.join(','));
+  window.history.replaceState(null,'',`${location.pathname}?${q}`);
+}
+const remember=()=>{savePreferences(prefKey,prefs);syncHistoryUrl();};
 const feedback=(message,error=false)=>{$('#feedback').textContent=message;$('#feedback').classList.toggle('error',error);};
 const queryForSelection=()=>new URLSearchParams({...selection,staged:$('#diff-kind').value==='staged'?'1':'0',ignored:$('#filter-ignored').checked?'1':'0',tracked:$('#filter-tracked').checked?'1':'0'});
-function setBusy(value,label='') {busy=value;$('#busy').textContent=value?label:'';document.body.classList.toggle('spinner',value);for(const button of document.querySelectorAll('#commit,#fetch,#push,#new-branch,#stash-all,#stage-all,#unstage-all,#discard,#stash-paths,#bc,#refresh,#command-form button:not([type="button"])'))button.disabled=value;updateTimeTravel();updateMerge();updateStageControls();}
+function setBusy(value,label='') {busy=value;$('#busy').textContent=value?label:'';document.body.classList.toggle('spinner',value);for(const button of document.querySelectorAll('#commit,#fetch,#push,#new-branch,#stash-all,#stage-changed,#stage-all,#unstage-all,#discard,#stash-paths,#bc,#refresh,#command-form button:not([type="button"])'))button.disabled=value;updateTimeTravel();updateMerge();updateStageControls();}
 async function action(op,body={},message=op){
+  if(historyMode&&op!=='bc'&&op!=='command'){feedback('History view is read-only.');return;}
   if(busy){feedback('Wait for the current Git operation to finish.');return;}setBusy(true,stageQueue.running?'Finishing staging…':`${message}…`);feedback(`${message}…`);
   try{if(!await stageQueue.whenIdle())return;const result=await post(route(op),body);feedback(result.message||`${message} completed.`);if((result.rebaseFinished&&result.rewritten)||result.historyChanged){prefs.force=true;$('#force').checked=true;remember();}await refresh();if(result.cherryPrepared){$('#message').value=result.commitMessage||'';$('#amend').checked=false;}return result;}
   catch(error){feedback(error.message,true);await refresh().catch(()=>{});}
   finally{setBusy(false);await pollLog();}
+}
+function openHistory(filePath){
+  const q=new URLSearchParams({id,path:filePath});
+  if(prefs.refs?.length)q.set('refs',prefs.refs.join(','));
+  window.open(`repo.html?${q}`,'_blank','noopener');
+}
+function pathAtSelection(){
+  if(selection.mode==='commit'){const row=commits.find(c=>c.oid===selection.ref);return row?.path||focusPath;}
+  if(selection.mode==='range'){const row=commits.find(c=>c.oid===selection.to);return row?.path||focusPath;}
+  return focusPath;
+}
+function updateHistoryChrome(){
+  if(!historyMode||!summary)return;
+  const at=pathAtSelection(),base=focusPath.split('/').at(-1);
+  document.title=`${base} · ${summary.name} · Git`;
+  $('#repo-title').textContent=summary.name;
+  $('#repo-meta').textContent=at&&at!==focusPath?`${focusPath} · was: ${at} · ${summary.branch}`:`${focusPath} · ${summary.branch} · ${summary.path}`;
 }
 function appendCommand(entry){
   const log=$('#command-log'),atBottom=log.scrollHeight-log.scrollTop-log.clientHeight<40;
@@ -42,6 +82,7 @@ const menu=element('div','popover');menu.setAttribute('popover','auto');document
 function showMenu(anchor,items,title){menu.replaceChildren();if(title)menu.append(element('p','',title));for(const item of items){const button=element('button',item.danger?'danger':'',item.label);button.disabled=!!item.disabled;button.onclick=()=>{menu.hidePopover();Promise.resolve().then(item.run).catch(error=>feedback(error.message,true));};menu.append(button);}if(!menu.matches(':popover-open'))menu.showPopover();const r=anchor.getBoundingClientRect();menu.style.left=`${Math.max(8,Math.min(r.left,innerWidth-menu.offsetWidth-8))}px`;menu.style.top=`${Math.max(8,Math.min(r.bottom+4,innerHeight-menu.offsetHeight-8))}px`;}
 async function createBranch(ref='HEAD'){const name=await ask('Create and check out branch',{label:'Branch name',message:`Start at ${ref.slice(0,30)}.`,value:''});if(name?.trim())await action('checkout',{create:name.trim(),ref},'Create branch');}
 function branchMenu(branch,anchor){
+  if(historyMode)return;
   const items=[{label:'Check out',run:()=>action('checkout',{ref:branch.ref},'Checkout')},{label:'Create branch here…',run:()=>createBranch(branch.oid)}];
   items.push({label:`Merge into ${summary?.branch==='(detached)'?'current branch':summary?.branch}`,disabled:busy||summary?.branch==='(detached)'||summary?.merge?.active||summary?.rebase?.active||branch.current,run:async()=>{const result=await action('merge',{ref:branch.ref},'Merge branch');if(result)await choose({mode:'wip'});}});
   items.push({label:'Rebase onto '+branch.name,disabled:busy||summary?.branch==='(detached)'||summary?.merge?.active||summary?.rebase?.active||branch.current,run:()=>startRebase(branch.ref)});
@@ -82,6 +123,24 @@ function renderBranches(){
       prefs.colors[local.ref]=prefs.colors[remote.ref]=color;
     }
   }
+  function selectedColors(pair){
+    const selected=[pair.local,pair.remote].filter(branch=>branch&&prefs.refs.includes(branch.ref));
+    if(!selected.length)return [];
+    if(pairState(pair)==='same')return [branchColor(selected.find(branch=>branch.current)||selected[0])];
+    return [...new Set(selected.map(branch=>branchColor(branch)))];
+  }
+  // Folder dots mirror selected graph colors so collapsed folders stay scannable.
+  const folderColors=new Map();
+  for(const pair of pairs){
+    const colors=selectedColors(pair);if(!colors.length)continue;
+    let prefix='';
+    for(const part of pair.name.split('/').slice(0,-1)){
+      prefix+=part+'/';
+      if(!folderColors.has(prefix))folderColors.set(prefix,[]);
+      const seen=folderColors.get(prefix);
+      for(const color of colors)if(!seen.includes(color))seen.push(color);
+    }
+  }
   function addPair(pair,parent){
     const state=pairState(pair),primary=pair.local||pair.remote;
     const row=element('div','branch'+(pair.local?.current?' current':'')),boxes=element('div','branch-boxes');
@@ -105,71 +164,198 @@ function renderBranches(){
       control([pair.local],pair.local?(state==='ahead'?'v':state==='behind'?'^':'x'):'','Show local '+pair.name);
     }
     const name=element('button','name',pair.name.split('/').at(-1)),more=element('button','menu-trigger','⋯');
-    name.title=pair.name+' · '+state;name.onclick=()=>branchMenu(primary,name);name.oncontextmenu=event=>{event.preventDefault();branchMenu(primary,name);};
+    name.title=pair.name+' · '+state;
+    if(!historyMode){name.onclick=()=>branchMenu(primary,name);name.oncontextmenu=event=>{event.preventDefault();branchMenu(primary,name)};}
     if(prefs.refs.includes(primary.ref))name.style.color=branchColor(primary);
-    more.setAttribute('aria-label','Actions for '+pair.name);more.onclick=()=>showMenu(more,[...(pair.local?[{label:'Local branch actions',run:()=>branchMenu(pair.local,more)}]:[]),...(pair.remote?[{label:'Remote branch actions',run:()=>branchMenu(pair.remote,more)}]:[])],pair.name);
+    if(historyMode)more.hidden=true;
+    else{more.setAttribute('aria-label','Actions for '+pair.name);more.onclick=()=>showMenu(more,[...(pair.local?[{label:'Local branch actions',run:()=>branchMenu(pair.local,more)}]:[]),...(pair.remote?[{label:'Remote branch actions',run:()=>branchMenu(pair.remote,more)}]:[])],pair.name);}
     row.append(boxes,name,more);parent.append(row);
   }
   const folders=new Map();
   for(const pair of pairs){let parent=list,prefix='';for(const part of pair.name.split('/').slice(0,-1)){
-    prefix+=part+'/';if(!folders.has(prefix)){const folder=element('details','branch-folder'),label=element('summary','',part);folder.open=prefs.branchFolders?.[prefix]!==false;folder.append(label);const key=prefix;folder.ontoggle=()=>{prefs.branchFolders||={};prefs.branchFolders[key]=folder.open;remember();};parent.append(folder);folders.set(prefix,folder);}parent=folders.get(prefix);
+    prefix+=part+'/';if(!folders.has(prefix)){
+      const folder=element('details','branch-folder'),label=element('summary'),name=element('span','branch-folder-name',part);
+      label.append(name);
+      const colors=folderColors.get(prefix)||[];
+      if(colors.length){
+        label.classList.add('has-selected');
+        const markers=element('span','folder-markers'),descriptions=[];
+        for(const color of colors){const mark=element('span','folder-dot');mark.style.background=color;mark.setAttribute('aria-hidden','true');markers.append(mark);descriptions.push(color);}
+        label.append(markers);
+        label.title=`${part} · ${colors.length} selected for graph`;
+        label.setAttribute('aria-label',label.title);
+      }else label.title=part;
+      // Default collapsed; open ancestors of selected / current graph refs (folder dots).
+      folder.open=folderPrefOpen(prefs.branchFolders,prefix,colors.length>0);folder.dataset.prefix=prefix;folder.append(label);const key=prefix;folder.ontoggle=()=>{prefs.branchFolders||={};prefs.branchFolders[key]=folder.open;remember();};parent.append(folder);folders.set(prefix,folder);
+    }parent=folders.get(prefix);
   }addPair(pair,parent);}
 
   remember();
 }
 function renderStashes(){
+  if(historyMode)return;
   $('#stashes').replaceChildren();
   for(const stash of stashRows){const wrap=element('div','row'),button=element('button','stash-item'+(selection.mode==='stash'&&selection.ref===stash.ref?' active':''),`${stash.ref} · ${stash.message}`),more=element('button','menu-trigger','⋯');button.style.flex='1';button.onclick=()=>{beforeStash=selection.mode==='stash'?beforeStash:{...selection};choose({mode:'stash',ref:stash.ref});};more.setAttribute('aria-label',`Actions for ${stash.ref}`);more.onclick=()=>showMenu(more,[...['apply','pop','drop'].map(op=>({label:op[0].toUpperCase()+op.slice(1),danger:op==='drop',run:async()=>{if(op==='drop'&&!await ask('Drop stash?',{confirm:true,message:`Permanently drop ${stash.ref}?`}))return;await action('stash',{action:op,ref:stash.ref},`Stash ${op}`);if(op==='pop'||op==='drop')await choose({mode:'wip'});}})),{label:'Rename…',run:async()=>{const message=await ask('Rename stash',{value:stash.message});if(message)await action('stash',{action:'rename',ref:stash.ref,message},'Rename stash');}}],stash.ref);wrap.append(button,more);$('#stashes').append(wrap);}
   if(!stashRows.length)$('#stashes').append(element('div','hint','No stashes.'));
 }
 async function loadGraph(){
-  const refs=summary?.branch==='(detached)'?[...new Set([...prefs.refs,'HEAD'])]:prefs.refs;commits=refs.length?await api(route('graph')+'?refs='+encodeURIComponent(refs.join(','))):[];renderGraph();
+  const refs=summary?.branch==='(detached)'?[...new Set([...prefs.refs,'HEAD'])]:prefs.refs;
+  const q=new URLSearchParams();if(refs.length)q.set('refs',refs.join(','));if(historyMode)q.set('path',focusPath);
+  commits=refs.length?await api(route('graph')+'?'+q):[];
+  if(historyMode){
+    if(!commits.some(c=>c.oid===selection.ref))selection=commits[0]?{mode:'commit',ref:commits[0].oid}:{mode:'commit',ref:''};
+  }
+  renderGraph();
+}
+function historyGraphSeeds(){
+  // Branch tips often never touched the file, so seed the projected follow heads instead.
+  const seeds=[],asParent=new Set(commits.flatMap(c=>c.parents)),heads=commits.filter(c=>!asParent.has(c.oid)),claimed=new Set();
+  for(const pair of pairBranches(branchRows)){
+    const selected=[pair.local,pair.remote].filter(branch=>branch&&prefs.refs.includes(branch.ref));
+    if(!selected.length)continue;
+    const branches=pairState(pair)==='same'?[selected.find(branch=>branch.current)||selected[0]]:selected;
+    for(const branch of branches){
+      const oid=commits.find(c=>c.oid===branch.oid)?.oid||heads.find(h=>!claimed.has(h.oid))?.oid||commits[0]?.oid;
+      if(!oid||claimed.has(oid))continue;
+      seeds.push({oid,color:branchColor(branch)});claimed.add(oid);
+    }
+  }
+  return seeds;
+}
+function renderHistoryCommit(row,body=''){
+  const panel=$('#historical-message');panel.replaceChildren();
+  if(!row){panel.textContent=body;return;}
+  const meta=element('div','commit-meta'),labels=element('div','commit-labels');
+  for(const branch of branchRows.filter(b=>b.oid===row.oid)){
+    const label=element('span','refs'+(branch.current?'':' other'),branch.name);
+    if(prefs.refs.includes(branch.ref)){label.style.color=branchColor(branch);label.style.border='1px solid '+branchColor(branch);}
+    labels.append(label);
+  }
+  for(const tag of tagRows.filter(tag=>tag.oid===row.oid)){
+    const badge=element('span','refs tag-ref',tag.name);badge.title=(tag.annotated?'Annotated tag: ':'Tag: ')+tag.name;labels.append(badge);
+  }
+  if(labels.childNodes.length)meta.append(labels);
+  meta.append(element('div','commit-subject',row.subject||'(no subject)'));
+  meta.append(element('div','commit-id',row.oid));
+  meta.append(element('div','commit-byline',`${row.author} · ${row.date}`));
+  panel.append(meta);
+  const rest=String(body||'').replace(/^[^\n]*\n?/,'').replace(/^\n/,'');
+  if(rest.trim())panel.append(element('pre','commit-body',rest));
 }
 function renderGraph(){
   const graph=$('#graph'),scroll=graph.scrollTop,hadFocus=graph.contains(document.activeElement);graph.replaceChildren();
-  const seeds=[];if(summary?.branch==='(detached)'&&summary.head)seeds.push({oid:summary.head,color:'#0969da'});for(const pair of pairBranches(branchRows)){const selected=[pair.local,pair.remote].filter(branch=>branch&&prefs.refs.includes(branch.ref));if(pairState(pair)==='same'&&selected.length){const branch=selected.find(branch=>branch.current)||selected[0];seeds.push({oid:branch.oid,color:branchColor(branch)});}else for(const branch of selected)seeds.push({oid:branch.oid,color:branchColor(branch)});}if(summary)seeds.push({oid:'@working-tree',color:'#0969da'});remember();
-  for(const rowData of colorGraph(layoutGraph(commits,{head:summary?.head,workingTree:!!summary}),seeds)){
+  const seeds=[];
+  if(historyMode)seeds.push(...historyGraphSeeds());
+  else{
+    if(summary?.branch==='(detached)'&&summary.head)seeds.push({oid:summary.head,color:'#0969da'});
+    for(const pair of pairBranches(branchRows)){
+      const selected=[pair.local,pair.remote].filter(branch=>branch&&prefs.refs.includes(branch.ref));
+      if(pairState(pair)==='same'&&selected.length){const branch=selected.find(branch=>branch.current)||selected[0];seeds.push({oid:branch.oid,color:branchColor(branch)});}
+      else for(const branch of selected)seeds.push({oid:branch.oid,color:branchColor(branch)});
+    }
+    if(summary)seeds.push({oid:'@working-tree',color:'#0969da'});
+  }
+  remember();
+  for(const rowData of colorGraph(layoutGraph(commits,{head:summary?.head,workingTree:!historyMode&&!!summary}),seeds)){
     if(rowData.commit.virtual){const row=element('div','graph-row working-tree-row'+(selection.mode==='wip'?' active':''));const subject=element('div','subject working-tree-subject');subject.append(element('strong','',`Working tree · ${summary.files} files`),element('small','working-tree-branch',summary.rebase?.active?'Rebasing '+summary.rebase.branch:summary.branch==='(detached)'?'Detached head':summary.branch));row.append(graphSVG(rowData,summary?.head),subject);row.onclick=()=>choose({mode:'wip'});graph.append(row);continue;}
     const commit=rowData.commit,row=element('div','graph-row'+(selection.mode==='commit'&&selection.ref===commit.oid?' active':'')+(selection.mode==='range'&&[selection.from,selection.to].includes(commit.oid)?' range':''));row.append(graphSVG(rowData,summary?.head));
-    const subject=element('div','subject');subject.title=commit.subject;
+    const subject=element('div','subject');subject.title=commit.subject+(commit.path&&commit.path!==focusPath?`\n${commit.path}`:'');
     for(const branch of branchRows.filter(b=>b.oid===commit.oid)){const label=element('span','refs'+(branch.current?'':' other'),branch.name);if(prefs.refs.includes(branch.ref)){label.style.color=branchColor(branch);label.style.border='1px solid '+branchColor(branch);}subject.append(label);}for(const tag of tagRows.filter(tag=>tag.oid===commit.oid)){const badge=element('span','refs tag-ref',tag.name);badge.title=(tag.annotated?'Annotated tag: ':'Tag: ')+tag.name;subject.append(badge);}subject.append(document.createTextNode(commit.subject));
-    row.append(subject,element('span','hash',commit.oid.slice(0,8)),element('span','author',commit.author),element('span','date',commit.date.slice(0,10)));row.title=`${commit.oid}\n${commit.author} · ${commit.date}`;
-    row.onclick=event=>{if((event.shiftKey||event.ctrlKey||event.metaKey)&&['commit','range'].includes(selection.mode)){const from=selection.ref||selection.from;choose(from===commit.oid?{mode:'commit',ref:commit.oid}:{mode:'range',from,to:commit.oid});}else choose(selection.mode==='commit'&&selection.ref===commit.oid?{mode:'wip'}:{mode:'commit',ref:commit.oid});};
-    row.oncontextmenu=event=>{event.preventDefault();showMenu(row,[{label:'Create Branch',run:()=>createBranch(commit.oid)},{label:'Tag',disabled:busy,run:()=>tagCommit(commit.oid)},{label:'Check out',run:()=>checkoutCommit(commit.oid)},{label:`Merge into ${summary?.branch==='(detached)'?'current branch':summary?.branch}`,disabled:busy||summary?.branch==='(detached)'||summary?.merge?.active||summary?.rebase?.active||commit.oid===summary?.head,run:async()=>{const result=await action('merge',{ref:commit.oid},'Merge commit');if(result)await choose({mode:'wip'});}},{label:'Rebase onto this commit',disabled:busy||summary?.branch==='(detached)'||summary?.merge?.active||summary?.rebase?.active||commit.oid===summary?.head,run:()=>startRebase(commit.oid)},{label:'Cherry-pick',disabled:busy||summary?.branch==='(detached)'||summary?.merge?.active||summary?.rebase?.active||summary?.cherry?.active||commit.parents.length>1,run:()=>pickChanges(commit.oid)},{label:'Restore working tree from here',disabled:busy||summary?.branch==='(detached)'||summary?.merge?.active||summary?.rebase?.active,run:()=>restoreSnapshot(commit.oid)},...['soft','hard'].map(mode=>({label:mode==='soft'?'Squash since here':'Reset to here',danger:true,disabled:busy||summary?.branch==='(detached)'||summary?.merge?.active||summary?.rebase?.active,run:()=>resetCommit(commit.oid,mode)}))],commit.oid.slice(0,10));};graph.append(row);
+    row.append(subject,element('span','hash',commit.oid.slice(0,8)),element('span','author',commit.author),element('span','date',commit.date.slice(0,10)));row.title=`${commit.oid}\n${commit.author} · ${commit.date}${commit.path?`\n${commit.path}`:''}`;
+    row.onclick=event=>{
+      if(historyMode){choose({mode:'commit',ref:commit.oid});return;}
+      if((event.shiftKey||event.ctrlKey||event.metaKey)&&['commit','range'].includes(selection.mode)){const from=selection.ref||selection.from;choose(from===commit.oid?{mode:'commit',ref:commit.oid}:{mode:'range',from,to:commit.oid});}
+      else choose(selection.mode==='commit'&&selection.ref===commit.oid?{mode:'wip'}:{mode:'commit',ref:commit.oid});
+    };
+    row.oncontextmenu=event=>{
+      event.preventDefault();
+      if(historyMode){showMenu(row,[{label:'Copy commit id',run:()=>navigator.clipboard.writeText(commit.oid).then(()=>feedback('Copied '+commit.oid.slice(0,8)+'.'),()=>feedback('Clipboard unavailable.',true))}],commit.oid.slice(0,10));return;}
+      showMenu(row,[{label:'Create Branch',run:()=>createBranch(commit.oid)},{label:'Tag',disabled:busy,run:()=>tagCommit(commit.oid)},{label:'Check out',run:()=>checkoutCommit(commit.oid)},{label:`Merge into ${summary?.branch==='(detached)'?'current branch':summary?.branch}`,disabled:busy||summary?.branch==='(detached)'||summary?.merge?.active||summary?.rebase?.active||commit.oid===summary?.head,run:async()=>{const result=await action('merge',{ref:commit.oid},'Merge commit');if(result)await choose({mode:'wip'});}},{label:'Rebase onto this commit',disabled:busy||summary?.branch==='(detached)'||summary?.merge?.active||summary?.rebase?.active||commit.oid===summary?.head,run:()=>startRebase(commit.oid)},{label:'Cherry-pick',disabled:busy||summary?.branch==='(detached)'||summary?.merge?.active||summary?.rebase?.active||summary?.cherry?.active||commit.parents.length>1,run:()=>pickChanges(commit.oid)},{label:'Restore working tree from here',disabled:busy||summary?.branch==='(detached)'||summary?.merge?.active||summary?.rebase?.active,run:()=>restoreSnapshot(commit.oid)},...['soft','hard'].map(mode=>({label:mode==='soft'?'Squash since here':'Reset to here',danger:true,disabled:busy||summary?.branch==='(detached)'||summary?.merge?.active||summary?.rebase?.active,run:()=>resetCommit(commit.oid,mode)}))],commit.oid.slice(0,10));
+    };graph.append(row);
   }
-  if(!commits.length)graph.append(element('div','empty',summary?.head?'No graph refs selected. Check branches on the left.':'No commits yet. Stage files and create your first commit.'));
+  if(!commits.length)graph.append(element('div','empty',historyMode?(summary?.head?'No commits touch this path in the selected branches.':'No commits yet.'):(summary?.head?'No graph refs selected. Check branches on the left.':'No commits yet. Stage files and create your first commit.')));
   graph.scrollTop=scroll;if(hadFocus){const active=graph.querySelector('.graph-row.active,.graph-row.range');if(active){active.tabIndex=0;active.focus({preventScroll:true});}}
 }
-async function choose(next){selection=next;activeFile='';selectedFiles.clear();renderGraph();renderStashes();await loadFiles();}
+async function choose(next){
+  if(historyMode&&next.mode==='wip')return;
+  selection=next;activeFile='';selectedFiles.clear();renderGraph();renderStashes();await loadFiles();
+}
 async function loadFiles(){
-  const rev=++viewRevision,q=queryForSelection();
+  const rev=++viewRevision;
+  if(historyMode){
+    $('#compose-editor').hidden=true;$('#file-actions').hidden=true;$('#historical-message').hidden=false;$('#diff-kind').hidden=true;
+    updateHistoryChrome();
+    if(!selection.ref||!commits.some(c=>c.oid===selection.ref)){
+      fileRows=[];renderFiles();$('#selection-meta').textContent='History · '+focusPath;$('#files-title').textContent=focusPath.split('/').at(-1);
+      renderHistoryCommit(null,commits.length?'Select a commit.':'No commits touch this path in the selected branches.');
+      clearFileDiff();return;
+    }
+    const row=commits.find(c=>c.oid===selection.ref),path=row?.path||focusPath;
+    fileRows=[{path,oldPath:row?.oldPath,code:row?.code||'M'}];
+    $('#selection-meta').textContent=`History · ${path}`;$('#files-title').textContent=path.split('/').at(-1);
+    const message=await api(route('commit-message')+'?ref='+encodeURIComponent(selection.ref));if(rev!==viewRevision)return;
+    renderHistoryCommit(row,message.message);renderFiles();
+    // Keep the graph visible until the path row is clicked for a diff.
+    if(activeFile===path)await showDiff(path,{auto:true});else clearFileDiff();
+    return;
+  }
+  const q=queryForSelection();
   const result=selection.mode==='wip'?await fetchWorking(false):await api(route('files')+'?'+q);if(rev!==viewRevision)return;const files=Array.isArray(result)?result:result.files;if(!Array.isArray(result)&&!stageQueue.running)acceptWorking(result);fileRows=files;applyStageOverrides();renderFiles();
+  noteTrackedOmission(result);
   const wip=selection.mode==='wip';$('#compose-editor').hidden=!wip;$('#file-actions').hidden=!wip;$('#historical-message').hidden=wip;$('#diff-kind').hidden=!wip;
   const label=wip?'Working tree':selection.mode==='commit'?`Commit ${selection.ref.slice(0,8)}`:selection.mode==='stash'?selection.ref:`${selection.from.slice(0,8)} → ${selection.to.slice(0,8)}`;$('#selection-meta').textContent=label;$('#files-title').textContent=label;
   if(!wip){const ref=selection.ref||selection.to;const message=await api(route('commit-message')+'?ref='+encodeURIComponent(ref));if(rev===viewRevision)$('#historical-message').textContent=message.message;}
   if(activeFile&&files.some(f=>f.path===activeFile))await showDiff(activeFile,{auto:true});else clearFileDiff();
 }
+function filePassesFilters(file){
+  if(file.ignored)return $('#filter-ignored').checked;
+  if(file.untracked||file.stashUntracked)return $('#filter-untracked').checked;
+  // Clean tracked vs changed (modified / added / deleted / conflicted).
+  return fileCategory(file)==='tracked'?$('#filter-tracked').checked:$('#filter-changed').checked;
+}
 function renderFiles(){
-  const root=$('#files'),focused=document.activeElement.closest?.('.file'),focusPath=focused?.querySelector('.path')?.title;root.replaceChildren();let files=fileRows;
-  if(selection.mode==='wip'){
-    files=files.filter(f=>f.ignored?$('#filter-ignored').checked:f.untracked?$('#filter-untracked').checked:$('#filter-tracked').checked);
+  const root=$('#files'),focused=document.activeElement.closest?.('.file'),restoreTitle=focused?.querySelector('.path')?.title;root.replaceChildren();let files=fileRows;
+  if(historyMode){
+    for(const file of files){
+      const row=element('div','file file-'+fileCategory(file)+(file.path===activeFile?' active':'')),name=element('button','path',file.path.split('/').at(-1));
+      const renameHint=file.oldPath&&file.oldPath!==file.path?` · was ${file.oldPath}`:'';
+      name.title=file.path+renameHint+' · '+fileStatus(file);row.dataset.path=file.path;row.title=name.title;
+      name.onclick=()=>showDiff(file.path,{auto:true});row.append(name);
+      row.onclick=event=>{if(event.target.closest('button'))return;name.click();};
+      root.append(row);
+    }
+    if(!files.length)root.append(element('div','empty','No path at this revision.'));
+    $('#files-title').title=files[0]?.path||focusPath;return;
   }
+  // Filters apply to WIP and to commit/range/stash views so Expand/dots match the visible selection.
+  files=files.filter(filePassesFilters);
   const search=$('#path-filter').value.toLowerCase();files=files.filter(f=>f.path.toLowerCase().includes(search));
-  const tree={files:[],folders:new Map()};
+  const tree={files:[],folders:new Map()},wip=selection.mode==='wip';
   for(const file of files){const parts=file.path.split('/');let node=tree;for(const name of parts.slice(0,-1)){if(!node.folders.has(name))node.folders.set(name,{files:[],folders:new Map()});node=node.folders.get(name);}node.files.push(file);}
-  summarizeFolders(tree,selection.mode==='wip');
+  summarizeFolders(tree,wip);
   function walk(node,container,prefix=''){
-    for(const [name,child] of [...node.folders].sort(([a],[b])=>a.localeCompare(b))){const full=prefix+name+'/',details=element('details','folder'),label=element('summary','',name);
+    for(const [name,child] of [...node.folders].sort(([a],[b])=>a.localeCompare(b))){const full=prefix+name+'/',details=element('details','folder'),label=element('summary'),title=element('span','folder-name',name);
+      label.append(title);
       const status=child.status,markers=element('span','folder-markers'),descriptions=[];
       label.classList.toggle('has-changes',status.changed);
       function dot(kind,description){const mark=element('span','folder-dot '+kind);mark.setAttribute('aria-hidden','true');markers.append(mark);descriptions.push(description);}
-      if(status.conflicted)dot('conflicted','Unresolved conflicts');
-      else {if(status.unstaged)dot('unstaged','Unstaged changes');if(status.staged)dot('staged','Staged changes');}
+      if(wip){
+        if(status.conflicted)dot('conflicted','Unresolved conflicts');
+        else {if(status.unstaged)dot('unstaged','Unstaged changes');if(status.staged)dot('staged','Staged changes');}
+      }else{
+        if(status.added)dot('added','Inserted files');
+        if(status.modified)dot('modified','Updated files');
+        if(status.deleted)dot('deleted','Deleted files');
+      }
       if(markers.children.length)label.append(markers);
       label.title=name+(descriptions.length?' · '+descriptions.join(' · '):status.changed?' · Changed files':' · No changes');
       label.setAttribute('aria-label',label.title);
-      details.open=prefs.folders[full]!==false;details.append(label);details.addEventListener('toggle',()=>{prefs.folders[full]=details.open;remember();});walk(child,details,full);container.append(details);}
-    for(const file of node.files.sort((a,b)=>a.path.localeCompare(b.path))){const row=element('div','file file-'+fileCategory(file)+(file.path===activeFile?' active':'')+(selectedFiles.has(file.path)?' selected':'')),name=element('button','path',file.path.split('/').at(-1));name.title=file.path+' · '+fileStatus(file);row.dataset.path=file.path;row.title=name.title;name.onclick=async event=>{
+      // Default collapsed; open paths to changes, search hits, or the active / multi-selected files.
+      const interesting=status.changed||!!search||activeFile?.startsWith(full)||[...selectedFiles].some(path=>path.startsWith(full));
+      details.open=folderPrefOpen(prefs.folders,full,interesting);details.dataset.path=full;details.append(label);details.addEventListener('toggle',()=>{prefs.folders[full]=details.open;remember();});walk(child,details,full);container.append(details);}
+    for(const file of node.files.sort((a,b)=>a.path.localeCompare(b.path))){const row=element('div','file file-'+fileCategory(file)+(file.path===activeFile?' active':'')+(selectedFiles.has(file.path)?' selected':'')),name=element('button','path',file.path.split('/').at(-1));
+      const renameHint=file.oldPath&&file.oldPath!==file.path?` · was ${file.oldPath}`:'';
+      name.title=file.path+renameHint+' · '+fileStatus(file);row.dataset.path=file.path;row.title=name.title;name.onclick=async event=>{
       if(event.ctrlKey||event.metaKey){if(selectedFiles.has(file.path))selectedFiles.delete(file.path);else selectedFiles.add(file.path);renderFiles();feedback(`${selectedFiles.size} paths selected.`);return;}
       if(activeFile===file.path)clearFileDiff();else await showDiff(file.path,{auto:true});
 
@@ -177,7 +363,7 @@ function renderFiles(){
       if(selection.mode==='wip'&&!file.ignored){const stage=element('button','stage stage-toggle'+(file.staged?' staged':''),'s');stage.disabled=busy||(!stageOverrides.has(file.path)&&!file.staged&&!file.unstaged&&!file.untracked);stage.setAttribute('aria-pressed',String(!!file.staged));stage.title=stage.disabled?'Unchanged tracked file':file.staged&&!file.conflicted?'Unstage':'Stage';stage.setAttribute('aria-label',`${file.staged?'Unstage':'Stage'} ${file.path}`);stage.onclick=()=>queueStage([file.path],file.staged&&!file.conflicted?'unstage':'stage');row.prepend(stage);}row.onclick=event=>{if(event.target.closest('button'))return;name.dispatchEvent(new MouseEvent('click',{bubbles:true,ctrlKey:event.ctrlKey,metaKey:event.metaKey}));};row.oncontextmenu=event=>{event.preventDefault();fileMenu(file,row);};container.append(row);
     }
   }
-  walk(tree,root);if(focusPath){const target=[...root.querySelectorAll('.path')].find(button=>button.title===focusPath);target?.focus({preventScroll:true});}if(!files.length)root.append(element('div','empty','No matching files.'));$('#files-title').title=`${files.length} files · Ctrl/Cmd+click selects paths`;
+  walk(tree,root);if(restoreTitle){const target=[...root.querySelectorAll('.path')].find(button=>button.title===restoreTitle);target?.focus({preventScroll:true});}if(!files.length)root.append(element('div','empty','No matching files.'));$('#files-title').title=`${files.length} files · Ctrl/Cmd+click selects paths`;
 }
 async function showDiff(file,{auto=false}={}){
   if(auto&&selection.mode==='wip'){const entry=fileRows.find(row=>row.path===file);if(entry?.staged&&!entry.unstaged)$('#diff-kind').value='staged';else if(entry&&!entry.staged)$('#diff-kind').value='unstaged';}
@@ -185,7 +371,7 @@ async function showDiff(file,{auto=false}={}){
   const result=await api(route('diff')+'?'+q);if(activeFile!==file)return;
   $('#diff-title').textContent=file;$('#diff').replaceChildren();
   for(const text of result.text.split('\n'))$('#diff').append(element('span','diff-line'+(text.startsWith('+')&&!text.startsWith('+++')?' add':text.startsWith('-')&&!text.startsWith('---')?' remove':text.startsWith('@@')?' hunk':''),text||' '));
-  if(!result.text)$('#diff').textContent='No diff in this mode. Try staged / unstaged.';
+  if(!result.text)$('#diff').textContent=selection.mode==='wip'?'No diff in this mode. Try staged / unstaged.':'No content available for this path.';
   if(result.truncated)$('#diff').append(element('span','diff-line hunk',`Preview capped at 200 KB (${result.bytes.toLocaleString()} bytes). Open Beyond Compare for full snapshots.`));
 }
 async function refresh(){
@@ -195,11 +381,26 @@ async function refresh(){
 }
 async function refreshAll(){
   if(!id)throw new Error('No repository id. Open a repository from the registry.');
-  summary=await api(route('summary'));branchRows=await api(route('branches'));tagRows=await api(route('tags'));stashRows=await api(route('stashes'));
-  $('#repo-title').textContent=summary.name;document.title=`${summary.name} · Git`;$('#repo-meta').textContent=`${summary.branch} · ${summary.head.slice(0,8)||'unborn'} · ${summary.path} · ↑${summary.ahead} ↓${summary.behind}`;
+  if(!repoPath)throw new Error('Repository is not in this browser\'s list. Register it again from the Repositories page.');
+  summary=await api(route('summary'));if(registered?.name)summary.name=registered.name;
+  branchRows=await api(route('branches'));tagRows=await api(route('tags'));stashRows=historyMode?[]:await api(route('stashes'));
+  if(historyMode)updateHistoryChrome();
+  else{$('#repo-title').textContent=summary.name;document.title=`${summary.name} · Git`;$('#repo-meta').textContent=`${summary.branch} · ${summary.head.slice(0,8)||'unborn'} · ${summary.path} · ↑${summary.ahead} ↓${summary.behind}`;}
   updateTimeTravel();updateMerge();renderBranches();renderStashes();await loadGraph();if(selection.mode==='stash'&&!stashRows.some(s=>s.ref===selection.ref))selection={mode:'wip'};await loadFiles();await pollLog();const baseline=await api(route('watch-history')+'?fresh=1');historyToken=baseline.token;lastHistoryCheck=Date.now();
 }
 $('#refresh').onclick=()=>refresh().catch(e=>feedback(e.message,true));
+$('#repo-title').onclick=async()=>{
+  if(!summary||busy||!id)return;
+  const name=await ask('Rename repository',{label:'Display name',message:'Changes only the name shown in this browser. The folder on disk is unchanged.',value:summary.name||''});
+  if(name===null)return;
+  const trimmed=name.trim();
+  if(!trimmed)return feedback('Enter a display name.',true);
+  if(trimmed===summary.name)return;
+  try{
+    const updated=renameRepo(id,trimmed);if(registered)registered.name=updated.name;summary={...summary,name:updated.name};
+    $('#repo-title').textContent=summary.name;document.title=`${summary.name} · Git`;feedback(`Renamed to ${summary.name}.`);
+  }catch(error){feedback(error.message,true);}
+};
 
 $('#fetch').onclick=()=>action('fetch',{},'Fetch');
 $('#force').checked=!!prefs.force;$('#force').onchange=()=>{prefs.force=$('#force').checked;remember();};
@@ -208,19 +409,50 @@ $('#push').onclick=async()=>{const force=$('#force').checked;const result=await 
 async function stash(paths=[]){const message=await ask('Stash working changes',{label:'Stash message',message:paths.length?`${paths.length} selected paths. Includes untracked files.`:'All working changes, including untracked files.',value:'Git cockpit stash'});if(message!==null){await action('stash',{action:'push',paths,message},'Create stash');selectedFiles.clear();}}
 $('#stash-all').onclick=()=>stash();$('#stash-paths').onclick=()=>{if(!selectedFiles.size)return feedback('Ctrl/Cmd+click paths to select files first.');stash([...selectedFiles]);};
 $('#discard').onclick=()=>discardFiles([...selectedFiles]);
+$('#stage-changed').onclick=()=>{const paths=fileRows.filter(f=>!f.ignored&&!f.untracked&&(f.unstaged||f.conflicted)).map(f=>f.path);if(paths.length)queueStage(paths,'stage');};
 $('#stage-all').onclick=()=>{const paths=fileRows.filter(f=>!f.ignored&&(f.untracked||f.unstaged||f.conflicted)).map(f=>f.path);if(paths.length)queueStage(paths,'stage');};
 $('#unstage-all').onclick=()=>{const paths=fileRows.filter(f=>f.staged).map(f=>f.path);if(paths.length)queueStage(paths,'unstage');};
 $('#amend').onchange=async()=>{if($('#amend').checked){try{$('#message').value=(await api(route('commit-message'))).message.trim();}catch(e){feedback(e.message,true);}}};
 $('#commit').onclick=async()=>{const amend=$('#amend').checked,result=await action('commit',{message:$('#message').value,amend},amend?'Amend commit':summary?.merge?.active?'Complete merge':'Commit');if(result){$('#message').value='';$('#amend').checked=false;if(amend){prefs.force=true;$('#force').checked=true;remember();}}};
-for(const category of ['tracked','untracked','ignored']){const check=$('#filter-'+category);check.checked=prefs.fileFilters?.[category]??(category!=='ignored');check.onchange=()=>{prefs.fileFilters=Object.fromEntries(['tracked','untracked','ignored'].map(name=>[name,$('#filter-'+name).checked]));remember();clearFileDiff();loadFiles().catch(e=>feedback(e.message,true));};}$('#path-filter').oninput=()=>{clearFileDiff();renderFiles();};
+const fileFilterIds=['tracked','changed','untracked','ignored'];
+for(const category of fileFilterIds){
+  const check=$('#filter-'+category);
+  check.checked=prefs.fileFilters?.[category]??(category!=='ignored');
+  check.onchange=()=>{
+    prefs.fileFilters=Object.fromEntries(fileFilterIds.map(name=>[name,$('#filter-'+name).checked]));
+    remember();clearFileDiff();
+    if(category==='changed')renderFiles();
+    else loadFiles().catch(e=>feedback(e.message,true));
+  };
+}
+$('#path-filter').oninput=()=>{clearFileDiff();renderFiles();};
 $('#diff-kind').value=prefs.staged?'staged':'unstaged';$('#diff-kind').onchange=()=>{prefs.staged=$('#diff-kind').value==='staged';remember();if(activeFile)showDiff(activeFile).catch(e=>feedback(e.message,true));};
-$('#sort-tree').onclick=()=>{const close=[...$('#files').querySelectorAll('details')].some(d=>d.open);for(const detail of $('#files').querySelectorAll('details'))detail.open=!close;};
+function collapseTree(root,folderSelector,persist){
+  const details=[...root.querySelectorAll(folderSelector)];
+  for(const detail of details){detail.open=false;persist?.(detail);}
+  remember();
+}
+function expandInteresting(root,folderSelector,persist){
+  const interesting=[...root.querySelectorAll(`${folderSelector}:has(.folder-dot)`)];
+  for(const detail of interesting){
+    for(let node=detail;node&&node!==root;node=node.parentElement){
+      if(node.matches?.(folderSelector)){node.open=true;persist?.(node);}
+    }
+  }
+  remember();
+}
+const persistBranchFolder=detail=>{prefs.branchFolders||={};if(detail.dataset.prefix)prefs.branchFolders[detail.dataset.prefix]=detail.open;};
+const persistFileFolder=detail=>{if(detail.dataset.path)prefs.folders[detail.dataset.path]=detail.open;};
+$('#expand-branches').onclick=()=>expandInteresting($('#branches'),'details.branch-folder',persistBranchFolder);
+$('#collapse-branches').onclick=()=>collapseTree($('#branches'),'details.branch-folder',persistBranchFolder);
+$('#expand-files').onclick=()=>expandInteresting($('#files'),'details.folder',persistFileFolder);
+$('#collapse-files').onclick=()=>collapseTree($('#files'),'details.folder',persistFileFolder);
 $('#bc').onclick=async()=>{if(!activeFile)return feedback('Select a file first.');await action('bc',Object.fromEntries(new URLSearchParams({...Object.fromEntries(queryForSelection()),path:activeFile})),'Launch Beyond Compare');};
 $('#command-form').onsubmit=async event=>{event.preventDefault();const command=$('#command').value.trim();if(!command||busy)return;history.push(command);historyIndex=history.length;$('#command').value='';await action('command',{command},'Run Git command');};
 $('#command').onkeydown=event=>{if(['ArrowUp','ArrowDown'].includes(event.key)){event.preventDefault();historyIndex=Math.max(0,Math.min(history.length,historyIndex+(event.key==='ArrowUp'?-1:1)));$('#command').value=history[historyIndex]||'';}};
 $('#clear-log').onclick=()=>$('#command-log').replaceChildren();
-document.addEventListener('keydown',event=>{if(event.key!=='Escape'||['INPUT','TEXTAREA'].includes(document.activeElement.tagName)||document.querySelector('dialog[open]'))return;if(selectedFiles.size){selectedFiles.clear();renderFiles();return;}if(selection.mode==='stash'&&beforeStash){const previous=beforeStash;beforeStash=null;choose(previous);}else choose({mode:'wip'});});
-const events=id?new EventSource('/api/git/'+route('events')):null;
+document.addEventListener('keydown',event=>{if(event.key!=='Escape'||['INPUT','TEXTAREA'].includes(document.activeElement.tagName)||document.querySelector('dialog[open]'))return;if(historyMode){if(document.querySelector('.center-pane')?.classList.contains('show-file-diff'))clearFileDiff();return;}if(selectedFiles.size){selectedFiles.clear();renderFiles();return;}if(selection.mode==='stash'&&beforeStash){const previous=beforeStash;beforeStash=null;choose(previous);}else choose({mode:'wip'});});
+const events=id&&repoPath?new EventSource('/api/git/'+route('events')+'?repoPath='+encodeURIComponent(repoPath)):null;
 events?.addEventListener('command',event=>{try{appendCommand(JSON.parse(event.data));}catch{}});
 try{await refresh();}catch(error){feedback(error.message,true);}
 const timer=setInterval(()=>{if(!document.hidden&&!busy&&!stageQueue.running)pollLog();},15000);window.addEventListener('pagehide',()=>{clearInterval(timer);events?.close();});
@@ -246,9 +478,16 @@ function divider(selector,axis,resize){
   };
   handle.onkeydown=event=>{const negative=axis==='x'?'ArrowLeft':'ArrowUp',positive=axis==='x'?'ArrowRight':'ArrowDown';if(event.key===negative||event.key===positive){event.preventDefault();resize((event.key===negative?-1:1)*(event.shiftKey?40:10));remember();}};
 }
-divider('#resize-left','x',delta=>{const max=Math.max(130,layout.clientWidth-document.querySelector('.files-pane').clientWidth-234);prefs.leftWidth=Math.max(130,Math.min(max,document.querySelector('.sidebar').clientWidth+delta));applyPanelSizes();});
-divider('#resize-right','x',delta=>{const max=Math.max(230,layout.clientWidth-document.querySelector('.sidebar').clientWidth-234);prefs.rightWidth=Math.max(230,Math.min(max,document.querySelector('.files-pane').clientWidth-delta));applyPanelSizes();});
-divider('#resize-console','y',delta=>{prefs.consoleHeight=Math.max(110,Math.min(innerHeight*.6,$('#console').clientHeight-delta));applyPanelSizes();});
+const DIVIDER=7,CENTER_MIN=220;
+divider('#resize-left','x',delta=>{
+  const right=prefs.rightWidth||320,max=Math.max(130,layout.clientWidth-right-DIVIDER*2-CENTER_MIN);
+  prefs.leftWidth=Math.max(130,Math.min(max,(prefs.leftWidth||220)+delta));applyPanelSizes();
+});
+divider('#resize-right','x',delta=>{
+  const left=prefs.leftWidth||220,max=Math.max(230,layout.clientWidth-left-DIVIDER*2-CENTER_MIN);
+  prefs.rightWidth=Math.max(230,Math.min(max,(prefs.rightWidth||320)-delta));applyPanelSizes();
+});
+divider('#resize-console','y',delta=>{prefs.consoleHeight=Math.max(110,Math.min(innerHeight*.6,(prefs.consoleHeight||230)-delta));applyPanelSizes();});
 applyPanelSizes();consoleVisible(!prefs.consoleClosed);window.addEventListener('resize',applyPanelSizes);
 
 function fileCategory(file){if(file.conflicted)return 'conflict';if(file.ignored)return 'ignored';if(file.untracked||file.stashUntracked)return 'untracked';if(file.code.includes('D'))return 'deleted';if(file.index==='A'||file.code.trim()==='A')return 'added';if(file.code.trim())return 'changed';return 'tracked';}
@@ -281,11 +520,18 @@ $('#graph').addEventListener('keydown',event=>{if((event.key==='Enter'||event.ke
 let watchTimer,watchStopped=false,watchRunning=false;
 function watchQuery(fresh=false){const q=new URLSearchParams({ignored:$('#filter-ignored').checked?'1':'0',tracked:$('#filter-tracked').checked?'1':'0'});if(fresh)q.set('fresh','1');if(activeFile&&selection.mode==='wip')q.set('path',activeFile);return q;}
 function fetchWorking(fresh){return api(route('watch')+'?'+watchQuery(fresh));}
+let trackedOmitNotice='';
+function noteTrackedOmission(data){
+  if(!data||Array.isArray(data)||!data.trackedOmitted){trackedOmitNotice='';return;}
+  const message=`Tracked list omitted (${Number(data.trackedTotal||0).toLocaleString()} files). Turn off Tracked or leave only Changed/Untracked on for large repos.`;
+  if(trackedOmitNotice===message)return;trackedOmitNotice=message;feedback(message);
+}
 function acceptWorking(data){
   workToken=data.token;activeDiffToken=data.activeToken;
   if(summary){Object.assign(summary,{dirty:data.dirty,files:data.count,staged:data.staged,merge:data.merge,rebase:data.rebase,cherry:data.cherry});}
   updateTimeTravel();updateMerge();updateStageControls();
   const label=document.querySelector('.working-tree-subject strong');if(label)label.textContent='Working tree · '+data.count+' files';
+  noteTrackedOmission(data);
 }
 async function reconcileWorking(fresh=false){
   const revision=stageQueue.revision,view=viewRevision,wasActive=activeFile,data=await fetchWorking(fresh);
@@ -313,13 +559,21 @@ async function checkWorkingTree(){
   if(watchStopped||watchRunning)return;watchRunning=true;
   try{
     if(!document.hidden&&!busy&&!stageQueue.running&&!refreshTask){
-      const revision=stageQueue.revision,view=viewRevision,data=await fetchWorking(false);
-      if(!busy&&!stageQueue.running&&!refreshTask&&revision===stageQueue.revision&&view===viewRevision){
-        if(workToken!==data.token){acceptWorking(data);if(selection.mode==='wip'){fileRows=data.files;renderFiles();if(activeFile)await showDiff(activeFile,{auto:true});}}
-        else if(activeFile&&selection.mode==='wip'&&activeDiffToken!==data.activeToken){activeDiffToken=data.activeToken;await showDiff(activeFile,{auto:true});}
-        if(Date.now()-lastHistoryCheck>15000&&!busy&&!stageQueue.running){
+      const revision=stageQueue.revision,view=viewRevision;
+      if(historyMode){
+        if(Date.now()-lastHistoryCheck>15000){
           const result=await api(route('watch-history'));lastHistoryCheck=Date.now();
-          if(!busy&&!stageQueue.running&&!refreshTask&&revision===stageQueue.revision){if(historyToken!==null&&historyToken!==result.token)await refresh();else historyToken=result.token;}
+          if(!busy&&!refreshTask&&revision===stageQueue.revision){if(historyToken!==null&&historyToken!==result.token)await refresh();else historyToken=result.token;}
+        }
+      }else{
+        const data=await fetchWorking(false);
+        if(!busy&&!stageQueue.running&&!refreshTask&&revision===stageQueue.revision&&view===viewRevision){
+          if(workToken!==data.token){acceptWorking(data);if(selection.mode==='wip'){fileRows=data.files;renderFiles();if(activeFile)await showDiff(activeFile,{auto:true});}}
+          else if(activeFile&&selection.mode==='wip'&&activeDiffToken!==data.activeToken){activeDiffToken=data.activeToken;await showDiff(activeFile,{auto:true});}
+          if(Date.now()-lastHistoryCheck>15000&&!busy&&!stageQueue.running){
+            const result=await api(route('watch-history'));lastHistoryCheck=Date.now();
+            if(!busy&&!stageQueue.running&&!refreshTask&&revision===stageQueue.revision){if(historyToken!==null&&historyToken!==result.token)await refresh();else historyToken=result.token;}
+          }
         }
       }
     }
@@ -381,6 +635,10 @@ function fileMenu(file,anchor){
   if(!selectedFiles.has(file.path)){selectedFiles.clear();selectedFiles.add(file.path);}
   const paths=[...selectedFiles],mode=selection.mode,ref=selection.ref;
   const items=[];
+  if(historyMode)return;
+  if(paths.length===1&&!file.untracked&&!file.ignored&&!file.stashUntracked){
+    items.push({label:'History ↗',run:()=>openHistory(file.path)});
+  }
   if(mode==='wip')items.push({label:'Discard changes',danger:true,disabled:busy,run:()=>discardFiles(paths)});
   if(mode==='commit')items.push({label:'Restore this version',disabled:busy||summary?.merge?.active||summary?.rebase?.active,run:async()=>{
     if(!await ask('Restore this version?',{confirm:true,message:'Replace these files with their version at '+ref.slice(0,8)+'? Existing staged and unstaged edits will be replaced. The result will be left unstaged. A file deleted in that commit will be removed.\n\n'+paths.join('\n')}))return;

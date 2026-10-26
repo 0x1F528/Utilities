@@ -29,6 +29,13 @@ test('Git cockpit operates only on disposable repositories: registry, staging, h
     assert.equal(get('files',{mode:'wip'}).length,0);
     assert.equal(get('files',{mode:'wip',tracked:'1'})[0].code,'  ');
     assert.match(get('diff',{mode:'commit',ref:first,path:'hello.txt'}).text,/\+hello/);
+    fs.writeFileSync(path.join(repo,'brand-new.txt'),'fresh\n');post('stage',{paths:['brand-new.txt']});post('commit',{message:'Add brand-new'});
+    const added=get('summary').head;assert.match(get('diff',{mode:'commit',ref:added,path:'brand-new.txt'}).text,/\+fresh/);
+    assert.ok(get('files',{mode:'commit',ref:added,tracked:'1'}).some(file=>file.path==='hello.txt'&&file.code==='  '));
+    assert.match(get('diff',{mode:'commit',ref:added,path:'hello.txt',tracked:'1'}).text,/hello/);
+    assert.equal(get('diff',{mode:'wip',path:'hello.txt',tracked:'1'}).text,'hello\n');
+    fs.writeFileSync(path.join(repo,'empty-new.txt'),'');post('stage',{paths:['empty-new.txt']});post('commit',{message:'Add empty'});
+    assert.match(get('diff',{mode:'commit',ref:get('summary').head,path:'empty-new.txt'}).text,/\(empty file\)|\+/);
     fs.writeFileSync(path.join(repo,'hello.txt'),'hello\nchanged\n');
     assert.match(get('diff',{path:'hello.txt'}).text,/\+changed/);
     post('stage',{paths:['hello.txt']});assert.match(get('diff',{path:'hello.txt',staged:'1'}).text,/\+changed/);
@@ -91,5 +98,67 @@ test('create keeps existing files and clone refuses nonempty destinations; both 
     const existing=path.join(temp,'existing-files');fs.mkdirSync(existing);fs.writeFileSync(path.join(existing,'keep.txt'),'Keep my files');
     post('create',{path:existing});assert.equal(fs.readFileSync(path.join(existing,'keep.txt'),'utf8'),'Keep my files');assert.equal(git(existing,'branch','--show-current'),'main');
     assert.throws(()=>post('create',{path:'relative-folder'}),/absolute/);
+  }finally{fs.rmSync(temp,{recursive:true,force:true});}
+});
+test('path-scoped graph follows renames and returns path-at-revision',()=>{
+  const temp=fs.mkdtempSync(path.join(os.tmpdir(),'utilities-git-follow-')),repo=path.join(temp,'repo');
+  fs.mkdirSync(repo);git(repo,'init','-b','main');git(repo,'config','core.autocrlf','false');git(repo,'config','user.name','Utility Test');git(repo,'config','user.email','utility-test@example.invalid');
+  const service=createGitService({stateDir:path.join(temp,'state')}),q=object=>new URLSearchParams(object);
+  const registration=service.dispatch('POST','/add',q({}),{path:repo}),id=registration.id;
+  const get=(op,query={})=>service.dispatch('GET',`/${id}/${op}`,q(query)),post=(op,body={})=>service.dispatch('POST',`/${id}/${op}`,q({}),body);
+  try{
+    fs.mkdirSync(path.join(repo,'old'));fs.writeFileSync(path.join(repo,'old','name.txt'),'one\n');
+    post('stage',{paths:['old/name.txt']});post('commit',{message:'Add old name'});
+    fs.mkdirSync(path.join(repo,'new'));git(repo,'mv','old/name.txt','new/name.txt');
+    post('commit',{message:'Rename to new'});
+    fs.appendFileSync(path.join(repo,'new','name.txt'),'two\n');post('stage',{paths:['new/name.txt']});post('commit',{message:'Edit after rename'});
+    const rows=get('graph',{refs:'main',path:'new/name.txt'});
+    assert.equal(rows.length,3);
+    assert.equal(rows[0].path,'new/name.txt');
+    assert.match(rows[0].subject,/Edit after rename/);
+    const rename=rows.find(row=>/^[RC]/.test(row.code||''));
+    assert.ok(rename);assert.equal(rename.path,'new/name.txt');assert.equal(rename.oldPath,'old/name.txt');
+    assert.ok(rows.some(row=>row.path==='old/name.txt'&&row.code.trim()==='A'));
+    assert.match(get('diff',{mode:'commit',ref:rows[0].oid,path:'new/name.txt'}).text,/\+two/);
+    // Projected parents stay inside the follow set so the UI draws one lineage, not orphans.
+    const oids=new Set(rows.map(row=>row.oid));
+    for(const row of rows)for(const parent of row.parents)assert.ok(oids.has(parent));
+    assert.deepEqual(rows[0].parents,[rows[1].oid]);
+    assert.deepEqual(rows[1].parents,[rows[2].oid]);
+    assert.deepEqual(rows[2].parents,[]);
+  }finally{fs.rmSync(temp,{recursive:true,force:true});}
+});
+test('rename updates the session display name without touching the repository path',()=>{
+  const temp=fs.mkdtempSync(path.join(os.tmpdir(),'utilities-git-rename-'));
+  const service=createGitService({stateDir:path.join(temp,'state')}),post=(action,body)=>service.dispatch('POST','/'+action,new URLSearchParams(),body);
+  try{
+    const source=path.join(temp,'project');fs.mkdirSync(source);git(source,'init','-b','main');
+    const registered=post('add',{path:source,name:'Original'});
+    assert.equal(registered.name,'Original');
+    const renamed=post('rename',{id:registered.id,name:'  Friendly name  '});
+    assert.equal(renamed.name,'Friendly name');assert.equal(renamed.path,registered.path);
+    assert.equal(service.dispatch('GET','/registry').repos.find(r=>r.id===registered.id).name,'Friendly name');
+    assert.equal(service.dispatch('GET',`/${registered.id}/summary`).name,'Friendly name');
+    assert.throws(()=>post('rename',{id:registered.id,name:'   '}),/display name/);
+    assert.throws(()=>post('rename',{id:'missing',name:'Nope'}),/not registered/);
+  }finally{fs.rmSync(temp,{recursive:true,force:true});}
+});
+test('status summarizes browser-supplied repository paths',()=>{
+  const temp=fs.mkdtempSync(path.join(os.tmpdir(),'utilities-git-status-'));
+  const service=createGitService({stateDir:path.join(temp,'state')}),post=(action,body)=>service.dispatch('POST','/'+action,new URLSearchParams(),body);
+  try{
+    const source=path.join(temp,'project');fs.mkdirSync(source);git(source,'init','-b','main');
+    const registered=post('add',{path:source,name:'Status demo'});
+    service.dispatch('POST','/forget',new URLSearchParams(),{id:registered.id});
+    const {repos}=post('status',{repos:[{id:registered.id,path:source,name:'Status demo'},{id:'missing',path:path.join(temp,'nope'),name:'Gone'}]});
+    assert.equal(repos[0].available,true);assert.equal(repos[0].name,'Status demo');
+    assert.equal(repos[1].available,false);
+    assert.equal(service.dispatch('GET','/legacy-registry').repos.length,0);
+    const legacySettings=service.dispatch('GET','/legacy-settings');
+    assert.equal(legacySettings.defaultRemote,'origin');
+    assert.equal(legacySettings.beyondComparePath,'');
+    service.dispatch('POST','/settings',new URLSearchParams(),{beyondComparePath:'',defaultRemote:'upstream'});
+    const branches=service.dispatch('GET',`/${registered.id}/branches`,new URLSearchParams({defaultRemote:'upstream',repoPath:source}));
+    assert.ok(Array.isArray(branches));
   }finally{fs.rmSync(temp,{recursive:true,force:true});}
 });

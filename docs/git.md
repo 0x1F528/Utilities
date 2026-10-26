@@ -1,81 +1,36 @@
-# Git (git/; server helpers in lib/)
+# Git (git/; server in lib/git-api.js)
 
-- Local browser Git cockpit backed by installed Git; real filesystem/repository operations, not a simulation.
-- Registry page: register/forget, forget unavailable, Create, Clone, settings; no Probe button.
-- Create initializes new/populated folders without changing files; existing repos are simply registered.
-- Clone requires a new/empty destination. Both use modals and auto-register only after success.
-- Native Browse selects server-side folders, owned by the active window; manual paths remain usable.
-- Registry rows span available width; Open cockpit and Forget sit beside info. Open cockpit opens a new tab.
-- Persist registry/settings/logs in .run/; per-repo UI preferences in localStorage. Forget never deletes a repo.
-- Repo layout: branches/stashes | history OR file diff | commit/message and files. Commit controls above files.
-- Drag vertical pane dividers and horizontal console divider; remember sizes. Console closes with x, opens bottom-left.
-- Command window streams dispatched Git commands/results, allows manual Git commands and session command history.
-- Spawn Git with argument arrays, no shell; validate paths and block traversal/symlink escapes and cwd overrides.
-- Bound execution/output; use existing credentials without interactive prompts. BC opens temporary file snapshots.
-- Poll working status every 2.5 s, history refs every 15 s; share short server caches across tabs.
-- Pause checks in hidden tabs/during operations. Watch active-file metadata for repeated edits.
-- Stage/unstage optimistically through a serial queue; reconcile status after each burst, not the whole cockpit.
-- Commit and other mutations wait for staging; failures restore real state and cancel remaining queued intentions.
-- Preserve compose text and current selection while refreshing; detect further edits to already-dirty files.
-- Branch names form slash-delimited collapsible folders. Pair origin refs with local refs; hide origin prefix.
-- Other remotes get separate folders. Branches heading only; no All toggle.
-- Compact paired selectors: remote left, local right; color denotes selection independently of symbols.
-- Same tip [=], local ahead [x|v], behind [x|^], diverged [x|x], remote-only [x| ], local-only [ |x].
-- Equal-tip box selects both as one entity/color. Empty halves disabled; checked-out selection locked blue.
-- Clear the old automatic blue selection on checkout; reserve blue for current lineage.
-- Assign other colors when shown: red, green, purple, orange, teal, pink, light blue, vibrant green,
-  mustard, light purple, dark brown. Use consistently on selectors, names, graph labels and paths.
-- Working tree is a virtual top commit with branch name or Detached head beneath its label; light-blue row.
-- Layout priority starts with Working tree/current head in lane 1; additional lineages get increasing priorities.
-- New paths use leftmost free lanes; existing paths stay put. At reunion lower-numbered priority keeps its lane.
-- Draw crossings without collapsing extra lanes. Head dots terminate paths; no line stub above them.
-- Color flows newest to oldest from selected refs. Blue wins; different non-grey colors combine to grey.
-- One non-grey overrides grey; grey propagates without retaining hidden original colors.
-- Multiple selected tips on one commit yield grey unless blue wins; paired equal local/origin is one seed.
-- Same-base split paths keep base identity; lighten right paths until reunion, then restore base shade.
-- Track nested shade scopes independently; cap lightening. Unseen reunions do not reset a shade early.
-- Clicking/arrow navigation selects commits; modifier-click a second commit compares a range. Escape returns.
-- Up/Down navigate branches, commits and visible file/folder rows; Space expands/collapses folders.
-- Clicking a file previews diff; clicking it again or outside file/diff controls restores history view.
-- Active file has black border. Ctrl/Cmd-click selects multiple paths; show group selection distinctly.
-- File filters are independent Tracked/Untracked/Ignored checkboxes, not a dropdown.
-- File backgrounds: untracked white, unchanged pale blue, newly added green, changed salmon, deleted pink,
-  ignored grey, conflicts orange. No status text labels; retain informative tooltips.
-- Compact square s button: stage/unstage, blue/white; disable grey for unchanged tracked files.
-- Diff supports staged/unstaged, commits, ranges, stashes and untracked files; cap inline output near 200 KB.
-- Working-tree Commit commits staged contents. Amend loads message and enables force-with-lease afterward.
-- Force-with-lease makes Push red; no extra force-push prompt. Successful push clears the flag.
-- Historical messages remain read-only. No separate New branch or Working tree toolbar buttons.
-- Branch menus: Check out, Create Branch, merge into current, rebase onto, catch-up and delete.
-- Remote checkout tracks a local branch. Catch-up handles fast-forward or confirmed diverged reset safely.
-- Commit menus: Create Branch, Tag, Check out, Merge into current, Rebase onto this commit, Cherry-pick,
-  Restore working tree from here, Squash since here and Reset to here.
-- Commit Check out uses detached HEAD; show it under Working tree, with no banner or return button.
-- Disable commit/amend in detached HEAD; Create Branch at that commit preserves staged and working edits.
-- Merge requires clean attached branch; normal fast-forward or merge commit. Remote targets use fetched refs.
-- Merge conflicts remain an ongoing state; resolve and stage, then Complete merge with generated message.
-- Offer Abort merge. Block conflicting operations during merge/rebase/cherry-pick.
-- Ordinary rebase onto branch or commit, clean attached branch only; merge preservation is not an option.
-- Rebase conflicts offer Continue rebase and Abort rebase; continuation must not open an editor.
-- Completed history-changing rebase enables force-with-lease. Track operation state for external refreshes.
-- Squash since here is soft reset to an ancestor: keep that commit, stage later changes, no automatic commit.
-- Reset to here is hard reset. Both menu items red, with explicit effects/target confirmation; no undo UI.
-- History-changing reset enables force-with-lease. Refuse reset during an operation or detached HEAD.
-- Restore working tree from here requires clean attached branch; copy snapshot without moving HEAD/history.
-- Leave restoration unstaged, suggest a message; protect ignored files that would be overwritten.
-- No commit-revert/Undo feature. User reviews and commits restored snapshot to preserve published history.
-- File menu: Discard changes in WIP; Restore this version and Cherry-pick in historical commit view.
-- Actions use clicked file or selected group. Confirm discard/restore with affected paths.
-- Discard clears staged/unstaged tracked edits to HEAD; selected untracked files are deleted.
-- Restore this version copies selected historical files, including deletions, and leaves results unstaged.
-- Preserve unrelated staging. Historical files absent from HEAD may become untracked.
-- Cherry-pick applies changes relative to selected commit's parent, not its snapshot; no automatic commit.
-- Whole commit leaves staged changes; conflicts offer Complete cherry-pick without commit, or Abort cherry-pick.
-- File-level cherry-pick applies selected patches atomically, staged; conflict means no changes.
-- Include both rename paths and binary patches; support root commits, reject merge commits initially.
-- Cherry-pick requires clean attached branch; fill source message for optional editing before user's commit.
-- Tag dialog: name plus optional annotation; duplicate names never overwrite. Show tags beside commits.
-- Tags stay local; no automatic push. Tagging does not move HEAD or modify files.
-- Stashes: all/selected paths including untracked, apply/pop with index, drop, rename; inspect stash files.
-- Esc returns from stash view. Persist refs, folder expansion, colors, filters, layout and force preference.
-- Test mutations only in disposable repositories/local remotes; cover conflicts, aborts and history preservation.
+Browser Git cockpit over real local repos via the host `git` binary. Not a simulation.
+
+## Architecture
+
+- `git/api.mjs` → `lib/git-api.js`. Spawn Git with argument arrays only (`shell: false`); no generic shell. 60s / 16 MB limits; credentials via existing helpers (`GIT_TERMINAL_PROMPT=0`).
+- Browser owns durable state: localStorage `git-registry` (`{id,path,name,addedAt}`), `git-settings` (BC path, default remote), `git-repo-<id>` UI prefs. Server keeps only `.run/git-commands.jsonl` and `.run/git-bc/` temps.
+- Cockpit APIs take `repoPath` (and settings query params). Id is first 12 hex of SHA-1 of canonical path (case-folded on Windows). Forget/rename are client-only.
+- One-shot migration from legacy `.run/git-registry.json` / `git-settings.json` when browser keys are empty/unmigrated.
+- `hostPath`: `C:\…` ↔ `/mnt/c/…` on register/clone/browse/BC; leave remote URLs alone.
+- Native Browse… is OS-specific (PowerShell / osascript / zenity|kdialog); cancel = no change; single picker, 5 min timeout.
+
+## Registry page
+
+- Register existing tree, Create (init in place, keep files), Clone (empty/new dest only). Auto-register after success. Status via `POST /status` with the browser list.
+- Open cockpit in a new tab. Forget never deletes disk data.
+
+## Cockpit
+
+- Layout: branches/stashes | graph or file diff | files + commit. Resizable panes; bottom command console (SSE + poll).
+- Graph: up to 200 commits; Working tree is a virtual tip row. Selected refs drive lanes; current lineage is locked blue; conflicting tip colors → grey. Modifier-click second commit = range; Escape back to WIP.
+- Branch list: slash folders; pair `origin/<name>` with local (hide `origin/` prefix); other remotes stay separate. Compact remote|local selectors with ahead/behind symbols; equal tips share one control/color. `%(upstream:track)` for counts (avoid per-branch `rev-list`).
+- Folders (branch + file) default collapsed; auto-open only ancestors of interesting items (selected/current refs, changes, active/selected file, search). Expand = all dotted folders.
+- File filters: independent Tracked / Changed / Untracked / Ignored. Cap clean tracked expansion (~2500); if larger, omit clean tracked and notice (prevents DOM OOM on huge trees).
+- Optimistic stage/unstage queue; reconcile after burst. Mutations wait for the queue. Poll WIP ~2.5s, refs ~15s; pause when hidden/busy.
+- Diff: WIP staged/unstaged, commit, range, stash; inline cap ~200 KB. BC launches left/right temp snapshots (not live files); on WSL convert args with `wslpath` when spawning a Windows `.exe`.
+- Path History ↗: read-only tab (`id` + file `path` + `refs`); `git log --follow`; separate prefs key `git-repo-<id>::history`.
+- Manual console: one Git subcommand, quoted args OK; reject shell operators, `-C`, absolute/`..` paths outside the repo.
+- Amend / history-rewriting ops set a force-with-lease flag (Push turns red until success). No separate force-push dialog beyond that.
+- Detached HEAD: show under Working tree; disable commit/amend; Create Branch keeps WT/index.
+- Catch-up: ff-only when behind; confirm hard reset when diverged; refuse dirty current / other-worktree checkout.
+- Squash since here = soft reset to ancestor (stage later commits, no auto-commit). Reset to here = hard. Restore WT from commit copies snapshot without moving HEAD; leave unstaged; block ignored overwrites. No revert/Undo feature.
+- Cherry-pick: vs parent, no auto-commit; whole-commit or atomic multi-file patch; reject merges; conflicts → complete without commit or abort. Fill message from source for edit.
+- Tags local only, never overwrite. Stash: all or selection (+untracked), apply/pop with index, drop, rename; Esc leaves stash view.
+- Destructive actions confirm. Tests only against disposable repos/local remotes.

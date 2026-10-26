@@ -1,10 +1,18 @@
 export const $=selector=>document.querySelector(selector);
 export function element(tag,className,text){const node=document.createElement(tag);if(className)node.className=className;if(text!==undefined)node.textContent=text;return node;}
-export async function api(route,{method='GET',body}={}){
-  const response=await fetch('/api/git/'+route,{method,headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined});
+export async function api(route,{method='GET',body,repoPath,settings}={}){
+  const [pathname,search='']=String(route).split('?');
+  const query=new URLSearchParams(search);
+  if(repoPath)query.set('repoPath',repoPath);
+  if(settings){
+    if(typeof settings.beyondComparePath==='string')query.set('beyondComparePath',settings.beyondComparePath);
+    if(typeof settings.defaultRemote==='string'&&settings.defaultRemote)query.set('defaultRemote',settings.defaultRemote);
+  }
+  const suffix=query.toString()?`?${query}`:'';
+  const response=await fetch('/api/git/'+pathname+suffix,{method,headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined});
   const value=await response.json();if(!response.ok)throw new Error(value.error||'Request failed.');return value;
 }
-export const post=(route,body={})=>api(route,{method:'POST',body});
+export const post=(route,body={},repoPath,settings)=>api(route,{method:'POST',body,repoPath,settings});
 export function preferences(key,fallback){try{return JSON.parse(localStorage.getItem(key))??fallback;}catch{return fallback;}}
 export function savePreferences(key,value){try{localStorage.setItem(key,JSON.stringify(value));}catch{}}
 export async function ask(title,{message='',label='Value',value='',confirm=false,multiline=false}={}){

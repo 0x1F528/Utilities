@@ -33,7 +33,7 @@ export function createServer({ root = ROOT, port = 8765 } = {}) {
       const pathname = decodeURIComponent((req.url || '/').split('?')[0]);
       if (pathname.includes('\\') || pathname.includes('\0') || pathname.split('/').some(s => s === '..' || s.startsWith('.'))) return send(res, 403, 'Forbidden path');
       const utilities = await discover(root);
-      if (pathname === '/api/health') return send(res, 200, JSON.stringify({ ok: true, pid: process.pid, root }), 'application/json');
+      if (pathname === '/api/health') return send(res, 200, JSON.stringify({ ok: true, pid: process.pid, root, platform: process.platform }), 'application/json');
       if (pathname === '/api/utilities') return send(res, 200, JSON.stringify(utilities), 'application/json');
       if (pathname === '/') {
         if (!['GET', 'HEAD'].includes(req.method)) return send(res, 405, 'Method not allowed');
