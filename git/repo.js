@@ -1,16 +1,26 @@
+import {summarizeFolders} from './folder-status.js';
+import {StageQueue} from './stage-queue.js';
 import {pairBranches,pairState} from './branch-tree.js';
 import {$,api,post,element,ask,preferences,savePreferences} from './shared.js';
 import {layoutGraph,colorGraph,graphSVG} from './graph-layout.js';
 const id=new URLSearchParams(location.search).get('id'),prefKey='git-repo-'+id;
 const prefs=preferences(prefKey,{refs:null,folders:{},colors:{},filter:'changed',force:false});prefs.folders||={};prefs.colors||={};
 let summary,tagRows=[],branchRows=[],stashRows=[],commits=[],fileRows=[],selection={mode:'wip'},beforeStash=null,selectedFiles=new Set(),activeFile='',viewRevision=0,busy=false,logCursor=0,history=[],historyIndex=0;
+let workToken=null,historyToken=null,activeDiffToken=null,lastHistoryCheck=0,refreshTask=null;
+const stageOverrides=new Map();
+const stageQueue=new StageQueue({
+  send:({op,paths})=>post(route(op),{paths}),
+  reconcile:()=>reconcileWorking(true),
+  onState:()=>updateStageControls(),
+  onError:error=>{stageOverrides.clear();workToken=null;feedback('Staging failed: '+error.message,true);}
+});
 const route=op=>`${id}/${op}`,remember=()=>savePreferences(prefKey,prefs);
 const feedback=(message,error=false)=>{$('#feedback').textContent=message;$('#feedback').classList.toggle('error',error);};
 const queryForSelection=()=>new URLSearchParams({...selection,staged:$('#diff-kind').value==='staged'?'1':'0',ignored:$('#filter-ignored').checked?'1':'0',tracked:$('#filter-tracked').checked?'1':'0'});
-function setBusy(value,label='') {busy=value;$('#busy').textContent=value?label:'';document.body.classList.toggle('spinner',value);for(const button of document.querySelectorAll('#commit,#fetch,#push,#new-branch,#stash-all,#stage-all,#unstage-all,#discard,#stash-paths,#bc,#refresh,#command-form button:not([type="button"])'))button.disabled=value;updateTimeTravel();updateMerge();}
+function setBusy(value,label='') {busy=value;$('#busy').textContent=value?label:'';document.body.classList.toggle('spinner',value);for(const button of document.querySelectorAll('#commit,#fetch,#push,#new-branch,#stash-all,#stage-all,#unstage-all,#discard,#stash-paths,#bc,#refresh,#command-form button:not([type="button"])'))button.disabled=value;updateTimeTravel();updateMerge();updateStageControls();}
 async function action(op,body={},message=op){
-  if(busy){feedback('Wait for the current Git operation to finish.');return;}setBusy(true,`${message}…`);feedback(`${message}…`);
-  try{const result=await post(route(op),body);feedback(result.message||`${message} completed.`);if((result.rebaseFinished&&result.rewritten)||result.historyChanged){prefs.force=true;$('#force').checked=true;remember();}await refresh();if(result.cherryPrepared){$('#message').value=result.commitMessage||'';$('#amend').checked=false;}return result;}
+  if(busy){feedback('Wait for the current Git operation to finish.');return;}setBusy(true,stageQueue.running?'Finishing staging…':`${message}…`);feedback(`${message}…`);
+  try{if(!await stageQueue.whenIdle())return;const result=await post(route(op),body);feedback(result.message||`${message} completed.`);if((result.rebaseFinished&&result.rewritten)||result.historyChanged){prefs.force=true;$('#force').checked=true;remember();}await refresh();if(result.cherryPrepared){$('#message').value=result.commitMessage||'';$('#amend').checked=false;}return result;}
   catch(error){feedback(error.message,true);await refresh().catch(()=>{});}
   finally{setBusy(false);await pollLog();}
 }
@@ -133,7 +143,7 @@ function renderGraph(){
 async function choose(next){selection=next;activeFile='';selectedFiles.clear();renderGraph();renderStashes();await loadFiles();}
 async function loadFiles(){
   const rev=++viewRevision,q=queryForSelection();
-  const files=await api(route('files')+'?'+q);if(rev!==viewRevision)return;fileRows=files;renderFiles();
+  const result=selection.mode==='wip'?await fetchWorking(false):await api(route('files')+'?'+q);if(rev!==viewRevision)return;const files=Array.isArray(result)?result:result.files;if(!Array.isArray(result)&&!stageQueue.running)acceptWorking(result);fileRows=files;applyStageOverrides();renderFiles();
   const wip=selection.mode==='wip';$('#compose-editor').hidden=!wip;$('#file-actions').hidden=!wip;$('#historical-message').hidden=wip;$('#diff-kind').hidden=!wip;
   const label=wip?'Working tree':selection.mode==='commit'?`Commit ${selection.ref.slice(0,8)}`:selection.mode==='stash'?selection.ref:`${selection.from.slice(0,8)} → ${selection.to.slice(0,8)}`;$('#selection-meta').textContent=label;$('#files-title').textContent=label;
   if(!wip){const ref=selection.ref||selection.to;const message=await api(route('commit-message')+'?ref='+encodeURIComponent(ref));if(rev===viewRevision)$('#historical-message').textContent=message.message;}
@@ -147,14 +157,24 @@ function renderFiles(){
   const search=$('#path-filter').value.toLowerCase();files=files.filter(f=>f.path.toLowerCase().includes(search));
   const tree={files:[],folders:new Map()};
   for(const file of files){const parts=file.path.split('/');let node=tree;for(const name of parts.slice(0,-1)){if(!node.folders.has(name))node.folders.set(name,{files:[],folders:new Map()});node=node.folders.get(name);}node.files.push(file);}
+  summarizeFolders(tree,selection.mode==='wip');
   function walk(node,container,prefix=''){
-    for(const [name,child] of [...node.folders].sort(([a],[b])=>a.localeCompare(b))){const full=prefix+name+'/',details=element('details','folder'),label=element('summary','',name);details.open=prefs.folders[full]!==false;details.append(label);details.addEventListener('toggle',()=>{prefs.folders[full]=details.open;remember();});walk(child,details,full);container.append(details);}
+    for(const [name,child] of [...node.folders].sort(([a],[b])=>a.localeCompare(b))){const full=prefix+name+'/',details=element('details','folder'),label=element('summary','',name);
+      const status=child.status,markers=element('span','folder-markers'),descriptions=[];
+      label.classList.toggle('has-changes',status.changed);
+      function dot(kind,description){const mark=element('span','folder-dot '+kind);mark.setAttribute('aria-hidden','true');markers.append(mark);descriptions.push(description);}
+      if(status.conflicted)dot('conflicted','Unresolved conflicts');
+      else {if(status.unstaged)dot('unstaged','Unstaged changes');if(status.staged)dot('staged','Staged changes');}
+      if(markers.children.length)label.append(markers);
+      label.title=name+(descriptions.length?' · '+descriptions.join(' · '):status.changed?' · Changed files':' · No changes');
+      label.setAttribute('aria-label',label.title);
+      details.open=prefs.folders[full]!==false;details.append(label);details.addEventListener('toggle',()=>{prefs.folders[full]=details.open;remember();});walk(child,details,full);container.append(details);}
     for(const file of node.files.sort((a,b)=>a.path.localeCompare(b.path))){const row=element('div','file file-'+fileCategory(file)+(file.path===activeFile?' active':'')+(selectedFiles.has(file.path)?' selected':'')),name=element('button','path',file.path.split('/').at(-1));name.title=file.path+' · '+fileStatus(file);row.dataset.path=file.path;row.title=name.title;name.onclick=async event=>{
       if(event.ctrlKey||event.metaKey){if(selectedFiles.has(file.path))selectedFiles.delete(file.path);else selectedFiles.add(file.path);renderFiles();feedback(`${selectedFiles.size} paths selected.`);return;}
       if(activeFile===file.path)clearFileDiff();else await showDiff(file.path,{auto:true});
 
     };row.append(name);
-      if(selection.mode==='wip'&&!file.ignored){const stage=element('button','stage stage-toggle'+(file.staged?' staged':''),'s');stage.disabled=!file.staged&&!file.unstaged&&!file.untracked;stage.setAttribute('aria-pressed',String(!!file.staged));stage.title=stage.disabled?'Unchanged tracked file':file.staged&&!file.conflicted?'Unstage':'Stage';stage.setAttribute('aria-label',`${file.staged?'Unstage':'Stage'} ${file.path}`);stage.onclick=()=>{clearFileDiff();return action(file.staged&&!file.conflicted?'unstage':'stage',{paths:[file.path]},file.staged&&!file.conflicted?'Unstage file':'Stage file');};row.prepend(stage);}row.onclick=event=>{if(event.target.closest('button'))return;name.dispatchEvent(new MouseEvent('click',{bubbles:true,ctrlKey:event.ctrlKey,metaKey:event.metaKey}));};row.oncontextmenu=event=>{event.preventDefault();fileMenu(file,row);};container.append(row);
+      if(selection.mode==='wip'&&!file.ignored){const stage=element('button','stage stage-toggle'+(file.staged?' staged':''),'s');stage.disabled=busy||(!stageOverrides.has(file.path)&&!file.staged&&!file.unstaged&&!file.untracked);stage.setAttribute('aria-pressed',String(!!file.staged));stage.title=stage.disabled?'Unchanged tracked file':file.staged&&!file.conflicted?'Unstage':'Stage';stage.setAttribute('aria-label',`${file.staged?'Unstage':'Stage'} ${file.path}`);stage.onclick=()=>queueStage([file.path],file.staged&&!file.conflicted?'unstage':'stage');row.prepend(stage);}row.onclick=event=>{if(event.target.closest('button'))return;name.dispatchEvent(new MouseEvent('click',{bubbles:true,ctrlKey:event.ctrlKey,metaKey:event.metaKey}));};row.oncontextmenu=event=>{event.preventDefault();fileMenu(file,row);};container.append(row);
     }
   }
   walk(tree,root);if(focusPath){const target=[...root.querySelectorAll('.path')].find(button=>button.title===focusPath);target?.focus({preventScroll:true});}if(!files.length)root.append(element('div','empty','No matching files.'));$('#files-title').title=`${files.length} files · Ctrl/Cmd+click selects paths`;
@@ -169,10 +189,15 @@ async function showDiff(file,{auto=false}={}){
   if(result.truncated)$('#diff').append(element('span','diff-line hunk',`Preview capped at 200 KB (${result.bytes.toLocaleString()} bytes). Open Beyond Compare for full snapshots.`));
 }
 async function refresh(){
+  if(refreshTask)return refreshTask;
+  refreshTask=(async()=>{await stageQueue.whenIdle();await refreshAll();})().finally(()=>{refreshTask=null;});
+  return refreshTask;
+}
+async function refreshAll(){
   if(!id)throw new Error('No repository id. Open a repository from the registry.');
   summary=await api(route('summary'));branchRows=await api(route('branches'));tagRows=await api(route('tags'));stashRows=await api(route('stashes'));
   $('#repo-title').textContent=summary.name;document.title=`${summary.name} · Git`;$('#repo-meta').textContent=`${summary.branch} · ${summary.head.slice(0,8)||'unborn'} · ${summary.path} · ↑${summary.ahead} ↓${summary.behind}`;
-  updateTimeTravel();updateMerge();renderBranches();renderStashes();await loadGraph();if(selection.mode==='stash'&&!stashRows.some(s=>s.ref===selection.ref))selection={mode:'wip'};await loadFiles();await pollLog();
+  updateTimeTravel();updateMerge();renderBranches();renderStashes();await loadGraph();if(selection.mode==='stash'&&!stashRows.some(s=>s.ref===selection.ref))selection={mode:'wip'};await loadFiles();await pollLog();const baseline=await api(route('watch-history')+'?fresh=1');historyToken=baseline.token;lastHistoryCheck=Date.now();
 }
 $('#refresh').onclick=()=>refresh().catch(e=>feedback(e.message,true));
 
@@ -183,8 +208,8 @@ $('#push').onclick=async()=>{const force=$('#force').checked;const result=await 
 async function stash(paths=[]){const message=await ask('Stash working changes',{label:'Stash message',message:paths.length?`${paths.length} selected paths. Includes untracked files.`:'All working changes, including untracked files.',value:'Git cockpit stash'});if(message!==null){await action('stash',{action:'push',paths,message},'Create stash');selectedFiles.clear();}}
 $('#stash-all').onclick=()=>stash();$('#stash-paths').onclick=()=>{if(!selectedFiles.size)return feedback('Ctrl/Cmd+click paths to select files first.');stash([...selectedFiles]);};
 $('#discard').onclick=()=>discardFiles([...selectedFiles]);
-$('#stage-all').onclick=()=>{const paths=fileRows.filter(f=>!f.ignored&&(!f.staged||f.unstaged)).map(f=>f.path);if(paths.length)action('stage',{paths},'Stage all');};
-$('#unstage-all').onclick=()=>{const paths=fileRows.filter(f=>f.staged).map(f=>f.path);if(paths.length)action('unstage',{paths},'Unstage all');};
+$('#stage-all').onclick=()=>{const paths=fileRows.filter(f=>!f.ignored&&(f.untracked||f.unstaged||f.conflicted)).map(f=>f.path);if(paths.length)queueStage(paths,'stage');};
+$('#unstage-all').onclick=()=>{const paths=fileRows.filter(f=>f.staged).map(f=>f.path);if(paths.length)queueStage(paths,'unstage');};
 $('#amend').onchange=async()=>{if($('#amend').checked){try{$('#message').value=(await api(route('commit-message'))).message.trim();}catch(e){feedback(e.message,true);}}};
 $('#commit').onclick=async()=>{const amend=$('#amend').checked,result=await action('commit',{message:$('#message').value,amend},amend?'Amend commit':summary?.merge?.active?'Complete merge':'Commit');if(result){$('#message').value='';$('#amend').checked=false;if(amend){prefs.force=true;$('#force').checked=true;remember();}}};
 for(const category of ['tracked','untracked','ignored']){const check=$('#filter-'+category);check.checked=prefs.fileFilters?.[category]??(category!=='ignored');check.onchange=()=>{prefs.fileFilters=Object.fromEntries(['tracked','untracked','ignored'].map(name=>[name,$('#filter-'+name).checked]));remember();clearFileDiff();loadFiles().catch(e=>feedback(e.message,true));};}$('#path-filter').oninput=()=>{clearFileDiff();renderFiles();};
@@ -198,7 +223,7 @@ document.addEventListener('keydown',event=>{if(event.key!=='Escape'||['INPUT','T
 const events=id?new EventSource('/api/git/'+route('events')):null;
 events?.addEventListener('command',event=>{try{appendCommand(JSON.parse(event.data));}catch{}});
 try{await refresh();}catch(error){feedback(error.message,true);}
-const timer=setInterval(pollLog,2500);window.addEventListener('pagehide',()=>{clearInterval(timer);events?.close();});
+const timer=setInterval(()=>{if(!document.hidden&&!busy&&!stageQueue.running)pollLog();},15000);window.addEventListener('pagehide',()=>{clearInterval(timer);events?.close();});
 
 // Resizable panes; keep each repository's preferred sizes.
 const layout=document.querySelector('.repo-layout');
@@ -252,17 +277,53 @@ keyboardRows.observe($('#graph'),{childList:true});
 for(const row of $('#graph').querySelectorAll('.graph-row')){row.tabIndex=0;row.setAttribute('role','button');}
 $('#graph').addEventListener('keydown',event=>{if((event.key==='Enter'||event.key===' ')&&event.target.matches('.graph-row')){event.preventDefault();event.target.click();}});
 
-// Poll sequentially and pause hidden tabs; preserve the current view and compose text.
-let lastFingerprint=null,watchTimer,watchStopped=false,watchRunning=false;
+// Working status is cheap and shared by the server; refs are checked less frequently.
+let watchTimer,watchStopped=false,watchRunning=false;
+function watchQuery(fresh=false){const q=new URLSearchParams({ignored:$('#filter-ignored').checked?'1':'0',tracked:$('#filter-tracked').checked?'1':'0'});if(fresh)q.set('fresh','1');if(activeFile&&selection.mode==='wip')q.set('path',activeFile);return q;}
+function fetchWorking(fresh){return api(route('watch')+'?'+watchQuery(fresh));}
+function acceptWorking(data){
+  workToken=data.token;activeDiffToken=data.activeToken;
+  if(summary){Object.assign(summary,{dirty:data.dirty,files:data.count,staged:data.staged,merge:data.merge,rebase:data.rebase,cherry:data.cherry});}
+  updateTimeTravel();updateMerge();updateStageControls();
+  const label=document.querySelector('.working-tree-subject strong');if(label)label.textContent='Working tree · '+data.count+' files';
+}
+async function reconcileWorking(fresh=false){
+  const revision=stageQueue.revision,view=viewRevision,wasActive=activeFile,data=await fetchWorking(fresh);
+  if(revision!==stageQueue.revision)return;
+  const changed=workToken!==data.token,diffChanged=activeDiffToken!==data.activeToken;
+  stageOverrides.clear();acceptWorking(data);
+  if(view===viewRevision&&selection.mode==='wip'){
+    fileRows=data.files;renderFiles();
+    if(wasActive&&activeFile===wasActive&&(changed||diffChanged||fresh))await showDiff(wasActive,{auto:true});
+  }
+}
+function applyStageOverrides(){for(const file of fileRows){if(!stageOverrides.has(file.path))continue;const staged=stageOverrides.get(file.path);file.staged=staged;if(staged){file.conflicted=false;file.index=file.untracked?'A':(file.index===' '?'M':file.index);file.untracked=false;file.unstaged=false;file.worktree=' ';file.code=file.index+' ';}else{file.unstaged=true;if(file.index==='A'){file.untracked=true;file.code='??';}else file.code=' M';file.index=' ';}}}
+function queueStage(paths,op){
+  if(busy||selection.mode!=='wip')return;
+  for(const path of paths)stageOverrides.set(path,op==='stage');
+  applyStageOverrides();renderFiles();stageQueue.enqueue({op,paths});
+}
+function updateStageControls(){
+  const pending=stageQueue.running||stageQueue.pending>0;
+  if(!busy)$('#busy').textContent=pending?'Staging '+(stageQueue.pending||'')+'…':'';
+  if(pending)for(const selector of ['#commit','#amend'])$(selector).disabled=true;
+  else if(!busy&&summary){$('#commit').disabled=summary.branch==='(detached)'||summary.rebase?.active||summary.cherry?.active||!!summary.merge?.conflicts;$('#amend').disabled=summary.branch==='(detached)'||summary.merge?.active||summary.rebase?.active||summary.cherry?.active;}
+}
 async function checkWorkingTree(){
-  if(watchStopped||watchRunning)return;
-  watchRunning=true;
+  if(watchStopped||watchRunning)return;watchRunning=true;
   try{
-    if(!document.hidden&&!busy){
-      const result=await api(route('fingerprint')+'?ignored='+($('#filter-ignored').checked?'1':'0'));
-      if(!busy){if(lastFingerprint!==null&&lastFingerprint!==result.fingerprint)await refresh();lastFingerprint=result.fingerprint;}
+    if(!document.hidden&&!busy&&!stageQueue.running&&!refreshTask){
+      const revision=stageQueue.revision,view=viewRevision,data=await fetchWorking(false);
+      if(!busy&&!stageQueue.running&&!refreshTask&&revision===stageQueue.revision&&view===viewRevision){
+        if(workToken!==data.token){acceptWorking(data);if(selection.mode==='wip'){fileRows=data.files;renderFiles();if(activeFile)await showDiff(activeFile,{auto:true});}}
+        else if(activeFile&&selection.mode==='wip'&&activeDiffToken!==data.activeToken){activeDiffToken=data.activeToken;await showDiff(activeFile,{auto:true});}
+        if(Date.now()-lastHistoryCheck>15000&&!busy&&!stageQueue.running){
+          const result=await api(route('watch-history'));lastHistoryCheck=Date.now();
+          if(!busy&&!stageQueue.running&&!refreshTask&&revision===stageQueue.revision){if(historyToken!==null&&historyToken!==result.token)await refresh();else historyToken=result.token;}
+        }
+      }
     }
-  }catch{/* Retry on the next poll after transient server or repository errors. */}
+  }catch{/* Retry transient errors on the next poll. */}
   finally{watchRunning=false;if(!watchStopped)watchTimer=setTimeout(checkWorkingTree,2500);}
 }
 checkWorkingTree();

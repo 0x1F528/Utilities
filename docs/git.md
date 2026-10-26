@@ -12,7 +12,10 @@
 - Command window streams dispatched Git commands/results, allows manual Git commands and session command history.
 - Spawn Git with argument arrays, no shell; validate paths and block traversal/symlink escapes and cwd overrides.
 - Bound execution/output; use existing credentials without interactive prompts. BC opens temporary file snapshots.
-- Poll a quiet status/ref/file-metadata fingerprint about every 2.5 s; refresh only on change, pause hidden tabs.
+- Poll working status every 2.5 s, history refs every 15 s; share short server caches across tabs.
+- Pause checks in hidden tabs/during operations. Watch active-file metadata for repeated edits.
+- Stage/unstage optimistically through a serial queue; reconcile status after each burst, not the whole cockpit.
+- Commit and other mutations wait for staging; failures restore real state and cancel remaining queued intentions.
 - Preserve compose text and current selection while refreshing; detect further edits to already-dirty files.
 - Branch names form slash-delimited collapsible folders. Pair origin refs with local refs; hide origin prefix.
 - Other remotes get separate folders. Branches heading only; no All toggle.
