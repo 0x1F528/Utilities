@@ -1,0 +1,17 @@
+{
+  "name": "local-utilities",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.12.0" },
+  "scripts": {
+    "start": "node server.js",
+    "start:bg": "node scripts/control.js start",
+    "stop": "node scripts/control.js stop",
+    "restart": "node scripts/control.js restart",
+    "status": "node scripts/control.js status",
+    "autostart:install": "node scripts/control.js install",
+    "autostart:uninstall": "node scripts/control.js uninstall",
+    "test": "node --test"
+  }
+}

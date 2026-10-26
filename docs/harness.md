@@ -1,0 +1,27 @@
+# Utilities harness
+
+- Self-hosted dashboard for one Windows computer; Node >=22.12, including Node 24; no WSL.
+- Bind only to 127.0.0.1:8765. Root runtime needs no external dependencies.
+- Discover root folders containing index.html; optional utility.json supplies name, description, icon.
+- Exclude dot folders, node_modules, scripts, lib and test. No directory listings.
+- New utilities appear without registration or restart. Use relative assets and a dashboard link.
+- Utilities are trusted code, mostly browser-only; localStorage is optional and shares the origin.
+- Dashboard lists discovered utilities. Serve directory index.html and common static MIME types.
+- Decode and validate paths; block traversal, symlink escapes and private server files.
+- Do not publicly serve API modules, package manifests or node_modules.
+- Optional <utility>/api.mjs handles /api/<utility>/*; server helpers live in lib/.
+- APIs may access filesystem and commands with the user's permissions; no generic shell endpoint.
+- Validate methods, bodies, paths, Host, Origin and cross-site request headers.
+- GET /api/health and /api/utilities expose manager status and discovery.
+- Load utility APIs lazily; restart to reload an already imported module.
+- Utility dependencies may be local; copy or bundle browser dependencies into public assets.
+- npm commands: start, start:bg, stop, restart, status, autostart:install, autostart:uninstall.
+- Background startup is hidden; Windows sign-in autostart uses the installing Node executable.
+- Store disposable process state and logs in gitignored .run/.
+- Start is idempotent; stop verifies manager identity and never kills an unrelated port owner.
+- Hello hosts a browser-only world clock plus status, stop/restart and manual recovery controls.
+- World map: bundled land/approximate timezone data, local solar day/night shading, no external requests.
+- Manually set Home: red longitude line and highlighted clock. Hover shows timezone, date and time.
+- Click to pin clocks; save Home/pins in localStorage. Allow timezone correction, editing and removal.
+- No city lookup or geolocation service. Intl handles timezone/DST; include keyboard map navigation.
+- After stopping, recover with npm run start:bg. Utilities share the manager lifecycle.

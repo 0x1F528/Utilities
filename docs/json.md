@@ -1,0 +1,24 @@
+# JSON (json/)
+
+- Pure client-side side-by-side JSON/JSONC editor, pretty printer and deep comparison; no persistence.
+- Seed differing sample documents on first open; Sample reloads them, Swap exchanges panes.
+- Each pane has line-number gutter, transparent textarea and synchronized highlight backdrop.
+- Support JSON comments, trailing commas, single-quoted strings and bare identifier keys.
+- Transform only outside strings/comments; map parse errors back to the original input line.
+- Debounce processing about 400 ms; line-number chrome updates immediately. Tab inserts two spaces.
+- Pretty-print semantic data changes with two-space indentation and a trailing newline.
+- Cosmetic-only whitespace/comment/trailing-comma edits do not trigger full pretty printing.
+- Bare-key quoting may rewrite text independently. Invalid input stays intact; mark its first error line.
+- Restore caret approximately after rewrites. Sort keys recursively with localeCompare, separately per pane.
+- Deep equality ignores object-key order, preserves array order and uses Object.is for scalar comparisons.
+- Diff recursively by JSONPath; kinds include missing, type, value and array length.
+- Show a path/kind/A/B diff table with bounded value previews.
+- Same-key value/type differences are salmon; elements present only on one side are light grey on that side.
+- Highlight full additional object/array blocks, not just their opening line.
+- Do not mark the root opening brace merely because descendants differ or one side lacks an element.
+- Build path-to-line maps while printing; remap to current text when pretty printing is skipped.
+- Distinct visual layers for errors, differences and scroll-lock anchors.
+- Optional Lock scroll aligns panes using the nearest shared JSONPath near the viewport middle.
+- Coalesce scroll work and suppress feedback loops; keep gutters and backdrops synchronized.
+- Diff-row click jumps both panes only with Lock scroll enabled; otherwise explain how to enable it.
+- Sorting both panes helps alignment when keys are reordered. Show anchor/line information beside lock status.

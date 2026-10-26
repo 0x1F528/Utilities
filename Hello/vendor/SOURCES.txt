@@ -1,0 +1,19 @@
+# Bundled world clock assets
+
+No external requests are required by the clock at runtime.
+
+## Natural Earth land map
+- Source: https://github.com/nvkelso/natural-earth-vector
+- File: geojson/ne_110m_land.geojson (downloaded 2026-10-17).
+- Public domain. See map-LICENSE.txt.
+
+## PhotoStructure timezone lookup
+- Source: https://github.com/photostructure/tz-lookup
+- File: tz.js (downloaded 2026-10-17).
+- CC0-1.0. See tz-LICENSE.txt; original and fork authors waive copyright.
+- Compact geographic lookup is approximate, especially near borders and over oceans.
+- Home/pin timezone overrides persist locally. Intl provides actual timezone/DST formatting.
+
+## Asset checksums (SHA-256)
+- land.json: 9e0729ee253ca7d7a5c4ae9395fb1902264c5377c52e224d13dd85010e2835d9
+- tz.js: 548133c31996a29b35120248e3ac92e4b7f50db5193a1c4a4da227e786b55c3a

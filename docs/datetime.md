@@ -1,0 +1,27 @@
+# Datetime (datetime/)
+
+- Pure client-side date/time reference and verification lab; no API or persistence.
+- Source: datetime-local picker, Now, Today 00:00 and free-text Parse any.
+- Display timezone selector uses Intl.supportedValuesOf with a short fallback; editable BCP-47 locale.
+- Display timezone affects presentation, never the source instant or browser-local App JDN.
+- Parse ISO, SQL datetime with optional fractions, date-only, SQL Server yyyymmdd and Date.parse fallback.
+- Unwrap TIMESTAMP and ODBC {ts '...'} wrappers before parsing.
+- Integer magnitude: abs >=1e11 is Unix ms; >=1e9 Unix seconds; positive <4e6 is integer JDN.
+- JDN input becomes browser-local midnight; do not support fractional Julian dates.
+- App JDN is the Gregorian integer day from browser-local Y/M/D, using reversible Gregorian arithmetic.
+- Show UTC-date JDN separately and whether it matches App JDN.
+- Instant/civil panel: ISO UTC, local string/civil, civil in selected timezone and browser timezone.
+- Julian/Unix panel: App JDN, UTC JDN, comparison, Unix seconds and milliseconds.
+- SQL dialect affects only the SQL table: generic, PostgreSQL, SQL Server, Oracle-ish.
+- Common SQL rows: date, local datetime, local milliseconds, UTC datetime, quoted literal.
+- PostgreSQL adds timestamptz ISO and TIMESTAMP/TIMESTAMPTZ literals.
+- SQL Server adds style 112, ISO milliseconds and ODBC timestamp literal.
+- Oracle adds DD-MON-YY and TIMESTAMP; generic adds ANSI TIMESTAMP and ISO SQL.
+- Locale table uses Intl styles and relative formatting; include a copyable Intl snippet.
+- Pattern formatter supports date-fns and Day.js/Moment token dialects, presets and a cheat sheet.
+- Produce formatted output and a copyable library-call snippet; no formatter-library dependency required.
+- Longest-token matching; date-fns quoted literals, Day.js bracket literals and backslash escapes.
+- Switching dialect resets its default pattern. Locale supplies month and weekday names.
+- Selected-zone civil parts come from Intl.formatToParts with hourCycle h23.
+- Debounce parsing, locale and pattern edits about 180 ms. Mark invalid input and explain status.
+- Every output value is copyable; status summarizes ISO and App JDN.

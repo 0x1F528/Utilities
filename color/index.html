@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Color · Utilities</title><link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header><a href="/">← Utilities</a><div><h1>Color</h1><p>A workbench for your next color scheme.</p></div><span class="badge">BROWSER ONLY · NO SAVING</span></header>
+<main>
+<div class="section-heading"><div><h2>Your palette <span>10 colors</span></h2><p>Edit any format. Enter applies immediately. Click a swatch to pick a color, or its row number to explore harmony previews.</p></div><button id="reset">Reset examples</button></div>
+<p class="hint">Each row is a full-width swatch: color 1 behind the top half, color 10 behind the bottom half. Rows 1 and 10 use white / black backgrounds instead. Cleared backgrounds fall back to white / black; translucent backgrounds are layered over those same bases. RGB, HSL and the picker set opaque colors.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Color conversion table"><table><thead><tr><th scope="col">Swatch</th><th scope="col">Hex</th><th scope="col">RGB</th><th scope="col">RGBA</th><th scope="col">HSL</th><th scope="col">HSLA</th><th scope="col">OKLCH</th><th scope="col">Named CSS color</th><th scope="col">Clear</th></tr></thead><tbody id="rows"></tbody></table></div>
+<section class="gradient" aria-labelledby="gradient-title"><div class="section-heading"><div><h2 id="gradient-title">Gradient studio</h2><p>Filled rows become stops. Drag the angle or fine-tune each position.</p></div><button id="even">Even stops</button></div>
+<div class="gradient-layout"><div><div id="preview" class="checker"><div id="gradient-fill"></div></div><div class="angle"><label for="angle">Angle</label><input id="angle" type="range" min="0" max="360" value="90"><output id="angle-value" for="angle">90°</output></div></div><div><div id="stops"></div><label for="gradient-css">CSS background</label><div class="css-field"><textarea id="gradient-css" readonly rows="4" spellcheck="false"></textarea><button id="copy-gradient">Copy CSS</button></div><p id="gradient-note" class="hint"></p></div></div></section>
+<footer>Values convert through linear sRGB. Out-of-gamut OKLCH colors are clipped for sRGB display. Refreshing resets the palette.</footer>
+</main><datalist id="color-names"></datalist><div id="toast" role="status" aria-live="polite"></div><script type="module" src="app.js"></script>
+</body></html>

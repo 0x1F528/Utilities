@@ -1,0 +1,29 @@
+# Color (color/)
+
+- Pure client-side color lab; no API or persistence. Seed ten varied colors on load.
+- Fixed ten rows: swatch/native picker, Hex, RGB, RGBA, HSL, HSLA, OKLCH, CSS name, Clear.
+- Full-width swatch area per row; compact monospace fields and equally compact copy buttons.
+- Sticky header, light chrome, dark #24292e page header; table grows vertically without an inner scrollbar.
+- Text edits parse after about 180 ms; Enter parses immediately and updates the other fields.
+- Invalid input marks only its field; empty input does not clear the color. Clear explicitly empties a row.
+- Native picker sets opaque RGB. Alpha survives only through alpha-capable text input.
+- Accept #RGB, #RGBA, #RRGGBB, #RRGGBBAA; output uppercase, with alpha bytes when translucent.
+- Parse rgb/rgba and hsl/hsla comma or space syntax; RGB accepts bytes or percentages.
+- Alpha accepts 0-1 or percentages; HSL hue accepts degrees, S/L percentages or fractions.
+- Parse OKLCH with optional slash alpha; L accepts fractions, percentages or numbers >1 as percent.
+- Internal color model: linear sRGB plus alpha; convert through OKLab/OKLCH.
+- CSS names include transparent; datalist assists entry. Reverse lookup requires an exact opaque match.
+- Prefer gray/cyan/magenta spellings; alpha zero is transparent.
+- Round HSL to one decimal, OKLCH L/C to three and H to one, alpha to three.
+- Copy per field with toast; clipboard failure selects text for manual copying.
+- Translucent swatches use row 1 above and row 10 below as substrates.
+- Rows 1 and 10 instead use white/black substrates to avoid recursive backgrounds.
+- Clicking the row number opens a harmony menu; Reset is the first choice.
+- Relationships: complementary, analogous, split complementary, triadic, tetradic, square, monochromatic.
+- Compute relationships in OKLCH; expose angle where useful and lightness/chroma for monochromatic.
+- Show derived colors above/below the picker; retain the original fields, picker and gradient stop.
+- Preserve alpha; reduce chroma to fit sRGB rather than clipping derived hues arbitrarily.
+- Gradient uses every filled row, adjustable angle, per-stop percentages and Even stops.
+- Re-even stops when filled row membership changes; otherwise preserve manual positions.
+- List stop editors in row order; sort CSS stops by position. Output hex, including alpha.
+- One filled row gives a solid preview. Provide CSS copy and transparency substrates.
