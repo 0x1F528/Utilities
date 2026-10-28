@@ -19,10 +19,12 @@ Browser Git cockpit over real local repos via the host `git` binary. Not a simul
 ## Cockpit
 
 - Layout: branches/stashes | graph or file diff | files + commit. Resizable panes; bottom command console (SSE + poll).
+- Per-panel `filter` boxes: case-insensitive substring; hide non-matches; keep folder ancestors and open to hits; highlight hits. Branches/stashes · commits (subject/oid/author/refs; Working tree always stays) · file paths.
 - Graph: up to 200 commits; Working tree is a virtual tip row. Selected refs drive lanes; current lineage is locked blue; conflicting tip colors → grey. Modifier-click second commit = range; Escape back to WIP.
-- Branch list: slash folders; pair `origin/<name>` with local (hide `origin/` prefix); other remotes stay separate. Compact remote|local selectors with ahead/behind symbols; equal tips share one control/color. `%(upstream:track)` for counts (avoid per-branch `rev-list`).
-- Folders (branch + file) default collapsed; auto-open only ancestors of interesting items (selected/current refs, changes, active/selected file, search). Expand = all dotted folders.
-- File filters: independent Tracked / Changed / Untracked / Ignored. Cap clean tracked expansion (~2500); if larger, omit clean tracked and notice (prevents DOM OOM on huge trees).
+- Branch list: Local/Remote filters (persisted) hide rows only — remote|local boxes always show the real pair. Slash folders; pair `origin/<name>` with local (hide `origin/` prefix); other remotes stay separate. Compact remote|local selectors with ahead/behind symbols; equal tips share one control/color. `%(upstream:track)` for counts (avoid per-branch `rev-list`).
+- Single-child folder spines (branches and files) elide same-dot runs as `A … F` (click `…` to expand that chain). Expand/Collapse clears elision expansions, then opens dotted folders / closes all.
+- File folders otherwise default collapsed; auto-open ancestors of interesting items (changes, active/selected file, search).
+- File filters: independent Tracked / Changed / Untracked / Ignored. Cap clean tracked expansion (~2500); if larger, toast and force Tracked off (prevents DOM OOM on huge trees).
 - Optimistic stage/unstage queue; reconcile after burst. Mutations wait for the queue. Poll WIP ~2.5s, refs ~15s; pause when hidden/busy.
 - Diff: WIP staged/unstaged, commit, range, stash; inline cap ~200 KB. BC launches left/right temp snapshots (not live files); on WSL convert args with `wslpath` when spawning a Windows `.exe`.
 - Path History ↗: read-only tab (`id` + file `path` + `refs`); `git log --follow`; separate prefs key `git-repo-<id>::history`.

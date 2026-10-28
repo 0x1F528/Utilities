@@ -1,6 +1,6 @@
-import {summarizeFolders} from './folder-status.js';
+import {summarizeFolders,collectFileChain,fileMarkerKey} from './folder-status.js';
 import {StageQueue} from './stage-queue.js';
-import {pairBranches,pairState} from './branch-tree.js';
+import {pairBranches,pairState,buildBranchFolderTree,collectSpine,elisionRuns,chainExpandKey,markerKey} from './branch-tree.js';
 import {$,api as request,post as send,element,ask,preferences,savePreferences} from './shared.js';
 import {getRepo,renameRepo} from './registry.js';
 import {loadSettings} from './settings-store.js';
@@ -21,7 +21,26 @@ if(historyMode){
   if(urlRefs)prefs.refs=urlRefs.split(',').filter(Boolean);
 }
 let summary,tagRows=[],branchRows=[],stashRows=[],commits=[],fileRows=[],selection=historyMode?{mode:'commit',ref:''}:{mode:'wip'},beforeStash=null,selectedFiles=new Set(),activeFile='',viewRevision=0,busy=false,logCursor=0,history=[],historyIndex=0;
-let workToken=null,historyToken=null,activeDiffToken=null,lastHistoryCheck=0,refreshTask=null;
+let workToken=null,historyToken=null,activeDiffToken=null,lastHistoryCheck=0,refreshTask=null,graphFilterText='';
+function setSelectionMeta(...parts){
+  const el=$('#selection-meta');if(!el)return;
+  el.replaceChildren();
+  for(const part of parts){
+    if(part==null||part==='')continue;
+    if(typeof part==='object'&&part.bold!=null)el.append(element('strong','',part.bold));
+    else el.append(document.createTextNode(String(part)));
+  }
+}
+function makeGraphFilter(){
+  const filter=element('input','panel-filter graph-row-filter');
+  filter.id='filter-graph';filter.type='search';filter.placeholder='filter';filter.setAttribute('aria-label','Filter commits');
+  filter.autocomplete='off';filter.value=graphFilterText;
+  filter.oninput=()=>{graphFilterText=filter.value;renderGraph();};
+  filter.onclick=event=>event.stopPropagation();
+  filter.onmousedown=event=>event.stopPropagation();
+  filter.onkeydown=event=>event.stopPropagation();
+  return filter;
+}
 const stageOverrides=new Map();
 const stageQueue=new StageQueue({
   send:({op,paths})=>post(route(op),{paths}),
@@ -38,6 +57,24 @@ function syncHistoryUrl(){
 }
 const remember=()=>{savePreferences(prefKey,prefs);syncHistoryUrl();};
 const feedback=(message,error=false)=>{$('#feedback').textContent=message;$('#feedback').classList.toggle('error',error);};
+const panelQuery=id=>($(id)?.value||'').trim().toLowerCase();
+const textMatches=(text,query)=>!query||String(text??'').toLowerCase().includes(query);
+/** Paint `text` into `node`, wrapping case-insensitive `query` hits in <mark class="filter-hit">. */
+function fillFilterHit(node,text,query=''){
+  const value=String(text??'');
+  node.replaceChildren();
+  if(!query){node.textContent=value;return;}
+  const lower=value.toLowerCase();
+  let cursor=0;
+  while(cursor<value.length){
+    const at=lower.indexOf(query,cursor);
+    if(at<0){node.append(document.createTextNode(value.slice(cursor)));break;}
+    if(at>cursor)node.append(document.createTextNode(value.slice(cursor,at)));
+    node.append(element('mark','filter-hit',value.slice(at,at+query.length)));
+    cursor=at+query.length;
+  }
+}
+function filterLabel(className,text,query){const node=element('span',className);fillFilterHit(node,text,query);return node;}
 const queryForSelection=()=>new URLSearchParams({...selection,staged:$('#diff-kind').value==='staged'?'1':'0',ignored:$('#filter-ignored').checked?'1':'0',tracked:$('#filter-tracked').checked?'1':'0'});
 function setBusy(value,label='') {busy=value;$('#busy').textContent=value?label:'';document.body.classList.toggle('spinner',value);for(const button of document.querySelectorAll('#commit,#fetch,#push,#new-branch,#stash-all,#stage-changed,#stage-all,#unstage-all,#discard,#stash-paths,#bc,#refresh,#command-form button:not([type="button"])'))button.disabled=value;updateTimeTravel();updateMerge();updateStageControls();}
 async function action(op,body={},message=op){
@@ -141,8 +178,14 @@ function renderBranches(){
       for(const color of colors)if(!seen.includes(color))seen.push(color);
     }
   }
+  const showLocal=$('#filter-branch-local')?.checked!==false,showRemote=$('#filter-branch-remote')?.checked!==false;
+  const branchSearch=panelQuery('#filter-branches');
   function addPair(pair,parent){
-    const state=pairState(pair),primary=pair.local||pair.remote;
+    const state=pairState(pair),visible=(showLocal&&pair.local)||(showRemote&&pair.remote);
+    if(!visible)return;
+    // Boxes always reflect the real remote|local pair; Local/Remote filters only hide rows.
+    const hasL=!!pair.local,hasR=!!pair.remote;
+    const primary=pair.local||pair.remote;
     const row=element('div','branch'+(pair.local?.current?' current':'')),boxes=element('div','branch-boxes');
     function control(branches,symbol,label){
       const present=branches.filter(Boolean),button=element('button','branch-box',symbol);
@@ -158,45 +201,99 @@ function renderBranches(){
       };
       boxes.append(button);
     }
-    if(state==='same'){boxes.classList.add('equal');control([pair.remote,pair.local],'=','Show local and origin '+pair.name);}
-    else {
-      control([pair.remote],pair.remote?'x':'','Show remote '+pair.name);
-      control([pair.local],pair.local?(state==='ahead'?'v':state==='behind'?'^':'x'):'','Show local '+pair.name);
+    // Remote is always the left cell, local the right — keep an empty slot when one side is missing.
+    if(hasL&&hasR&&state==='same'){boxes.classList.add('equal');control([pair.remote,pair.local],'=','Show local and origin '+pair.name);}
+    else{
+      control(hasR?[pair.remote]:[],hasR?'x':'','Show remote '+pair.name);
+      control(hasL?[pair.local]:[],hasL?(state==='ahead'?'v':state==='behind'?'^':'x'):'','Show local '+pair.name);
     }
-    const name=element('button','name',pair.name.split('/').at(-1)),more=element('button','menu-trigger','⋯');
+    const name=element('button','name');fillFilterHit(name,pair.name.split('/').at(-1),branchSearch);const more=element('button','menu-trigger','⋯');
     name.title=pair.name+' · '+state;
     if(!historyMode){name.onclick=()=>branchMenu(primary,name);name.oncontextmenu=event=>{event.preventDefault();branchMenu(primary,name)};}
     if(prefs.refs.includes(primary.ref))name.style.color=branchColor(primary);
     if(historyMode)more.hidden=true;
-    else{more.setAttribute('aria-label','Actions for '+pair.name);more.onclick=()=>showMenu(more,[...(pair.local?[{label:'Local branch actions',run:()=>branchMenu(pair.local,more)}]:[]),...(pair.remote?[{label:'Remote branch actions',run:()=>branchMenu(pair.remote,more)}]:[])],pair.name);}
+    else{more.setAttribute('aria-label','Actions for '+pair.name);more.onclick=()=>showMenu(more,[...(hasL?[{label:'Local branch actions',run:()=>branchMenu(pair.local,more)}]:[]),...(hasR?[{label:'Remote branch actions',run:()=>branchMenu(pair.remote,more)}]:[])],pair.name);}
     row.append(boxes,name,more);parent.append(row);
   }
-  const folders=new Map();
-  for(const pair of pairs){let parent=list,prefix='';for(const part of pair.name.split('/').slice(0,-1)){
-    prefix+=part+'/';if(!folders.has(prefix)){
-      const folder=element('details','branch-folder'),label=element('summary'),name=element('span','branch-folder-name',part);
-      label.append(name);
-      const colors=folderColors.get(prefix)||[];
-      if(colors.length){
-        label.classList.add('has-selected');
-        const markers=element('span','folder-markers'),descriptions=[];
-        for(const color of colors){const mark=element('span','folder-dot');mark.style.background=color;mark.setAttribute('aria-hidden','true');markers.append(mark);descriptions.push(color);}
-        label.append(markers);
-        label.title=`${part} · ${colors.length} selected for graph`;
-        label.setAttribute('aria-label',label.title);
-      }else label.title=part;
-      // Default collapsed; open ancestors of selected / current graph refs (folder dots).
-      folder.open=folderPrefOpen(prefs.branchFolders,prefix,colors.length>0);folder.dataset.prefix=prefix;folder.append(label);const key=prefix;folder.ontoggle=()=>{prefs.branchFolders||={};prefs.branchFolders[key]=folder.open;remember();};parent.append(folder);folders.set(prefix,folder);
-    }parent=folders.get(prefix);
-  }addPair(pair,parent);}
+  const visiblePairs=pairs.filter(pair=>{
+    if(!((showLocal&&pair.local)||(showRemote&&pair.remote)))return false;
+    return textMatches(pair.name,branchSearch);
+  });
+  prefs.branchChainsExpanded||={};
+  function appendMarkers(label,colors,titleBase){
+    if(!colors.length){label.title=titleBase;return;}
+    label.classList.add('has-selected');
+    const markers=element('span','folder-markers');
+    for(const color of colors){const mark=element('span','folder-dot');mark.style.background=color;mark.setAttribute('aria-hidden','true');markers.append(mark);}
+    label.append(markers);
+    label.title=`${titleBase} · ${colors.length} selected for graph`;
+    label.setAttribute('aria-label',label.title);
+  }
+  function makeFolder(prefix,summaryLabel,colors,interesting){
+    const folder=element('details','branch-folder');
+    folder.open=folderPrefOpen(prefs.branchFolders,prefix,interesting||colors.length>0||!!branchSearch);
+    folder.dataset.prefix=prefix;
+    folder.append(summaryLabel);
+    folder.ontoggle=()=>{prefs.branchFolders||={};prefs.branchFolders[prefix]=folder.open;remember();};
+    return folder;
+  }
+  function renderFolderContents(node,container){
+    for(const pair of node.pairs)addPair(pair,container);
+    const children=[...node.children.values()].sort((a,b)=>a.name.localeCompare(b.name));
+    for(const child of children){
+      const {spine,tip}=collectSpine(child);
+      const chain=tip?[...spine,tip]:spine;
+      if(chain.length>=2){
+        const runs=elisionRuns(chain,item=>markerKey(folderColors.get(item.prefix)||[]));
+        let host=container,last=chain.at(-1);
+        for(const run of runs){
+          const key=chainExpandKey(run),expanded=!!prefs.branchChainsExpanded[key];
+          const colors=folderColors.get(run[0].prefix)||[];
+          const pathTitle=run.map(item=>item.name).join(' / ');
+          if(expanded||run.length<3){
+            for(const seg of run){
+              const segColors=folderColors.get(seg.prefix)||[];
+              const label=element('summary');label.append(filterLabel('branch-folder-name',seg.name,branchSearch));appendMarkers(label,segColors,seg.name);
+              const folder=makeFolder(seg.prefix,label,segColors,segColors.length>0);
+              host.append(folder);host=folder;last=seg;
+            }
+          }else{
+            const first=run[0];last=run.at(-1);
+            const label=element('summary','branch-chain-summary');
+            label.append(filterLabel('branch-folder-name',first.name,branchSearch));
+            const ellipsis=element('button','branch-chain-ellipsis','…');
+            ellipsis.type='button';ellipsis.title=`Show ${run.length-2} folders in ${pathTitle}`;
+            ellipsis.setAttribute('aria-label',ellipsis.title);
+            ellipsis.onclick=event=>{event.preventDefault();event.stopPropagation();prefs.branchChainsExpanded[key]=true;remember();renderBranches();};
+            label.append(ellipsis,filterLabel('branch-folder-name',last.name,branchSearch));
+            appendMarkers(label,colors,pathTitle);
+            const folder=makeFolder(first.prefix+'…'+last.prefix,label,colors,colors.length>0);
+            folder.dataset.chainKey=key;
+            host.append(folder);host=folder;
+          }
+        }
+        renderFolderContents(last,host);
+      }else{
+        const colors=folderColors.get(child.prefix)||[];
+        const label=element('summary');label.append(filterLabel('branch-folder-name',child.name,branchSearch));appendMarkers(label,colors,child.name);
+        const folder=makeFolder(child.prefix,label,colors,colors.length>0);
+        container.append(folder);renderFolderContents(child,folder);
+      }
+    }
+  }
+  renderFolderContents(buildBranchFolderTree(visiblePairs),list);
+  if(!visiblePairs.length)list.append(element('div','empty',!showLocal&&!showRemote?'Turn on Local or Remote to list branches.':branchSearch?'No matching branches.':'No branches match the Local/Remote filter.'));
 
   remember();
 }
 function renderStashes(){
   if(historyMode)return;
+  const search=panelQuery('#filter-branches');
   $('#stashes').replaceChildren();
-  for(const stash of stashRows){const wrap=element('div','row'),button=element('button','stash-item'+(selection.mode==='stash'&&selection.ref===stash.ref?' active':''),`${stash.ref} · ${stash.message}`),more=element('button','menu-trigger','⋯');button.style.flex='1';button.onclick=()=>{beforeStash=selection.mode==='stash'?beforeStash:{...selection};choose({mode:'stash',ref:stash.ref});};more.setAttribute('aria-label',`Actions for ${stash.ref}`);more.onclick=()=>showMenu(more,[...['apply','pop','drop'].map(op=>({label:op[0].toUpperCase()+op.slice(1),danger:op==='drop',run:async()=>{if(op==='drop'&&!await ask('Drop stash?',{confirm:true,message:`Permanently drop ${stash.ref}?`}))return;await action('stash',{action:op,ref:stash.ref},`Stash ${op}`);if(op==='pop'||op==='drop')await choose({mode:'wip'});}})),{label:'Rename…',run:async()=>{const message=await ask('Rename stash',{value:stash.message});if(message)await action('stash',{action:'rename',ref:stash.ref,message},'Rename stash');}}],stash.ref);wrap.append(button,more);$('#stashes').append(wrap);}
+  const visible=stashRows.filter(stash=>textMatches(`${stash.ref} ${stash.message}`,search));
+  for(const stash of visible){const wrap=element('div','row'),button=element('button','stash-item'+(selection.mode==='stash'&&selection.ref===stash.ref?' active':''));fillFilterHit(button,`${stash.ref} · ${stash.message}`,search);const more=element('button','menu-trigger','⋯');button.style.flex='1';button.onclick=()=>{beforeStash=selection.mode==='stash'?beforeStash:{...selection};choose({mode:'stash',ref:stash.ref});};more.setAttribute('aria-label',`Actions for ${stash.ref}`);more.onclick=()=>showMenu(more,[...['apply','pop','drop'].map(op=>({label:op[0].toUpperCase()+op.slice(1),danger:op==='drop',run:async()=>{if(op==='drop'&&!await ask('Drop stash?',{confirm:true,message:`Permanently drop ${stash.ref}?`}))return;await action('stash',{action:op,ref:stash.ref},`Stash ${op}`);if(op==='pop'||op==='drop')await choose({mode:'wip'});}})),{label:'Rename…',run:async()=>{const message=await ask('Rename stash',{value:stash.message});if(message)await action('stash',{action:'rename',ref:stash.ref,message},'Rename stash');}}],stash.ref);wrap.append(button,more);$('#stashes').append(wrap);}
   if(!stashRows.length)$('#stashes').append(element('div','hint','No stashes.'));
+  else if(!visible.length)$('#stashes').append(element('div','hint','No matching stashes.'));
 }
 async function loadGraph(){
   const refs=summary?.branch==='(detached)'?[...new Set([...prefs.refs,'HEAD'])]:prefs.refs;
@@ -242,8 +339,18 @@ function renderHistoryCommit(row,body=''){
   const rest=String(body||'').replace(/^[^\n]*\n?/,'').replace(/^\n/,'');
   if(rest.trim())panel.append(element('pre','commit-body',rest));
 }
+function commitMatchesFilter(commit,query){
+  if(!query)return true;
+  if(textMatches(commit.subject,query)||textMatches(commit.oid,query)||textMatches(commit.author,query)||textMatches(commit.date,query)||textMatches(commit.path,query))return true;
+  if(branchRows.some(branch=>branch.oid===commit.oid&&textMatches(branch.name,query)))return true;
+  if(tagRows.some(tag=>tag.oid===commit.oid&&textMatches(tag.name,query)))return true;
+  return false;
+}
 function renderGraph(){
-  const graph=$('#graph'),scroll=graph.scrollTop,hadFocus=graph.contains(document.activeElement);graph.replaceChildren();
+  const graph=$('#graph'),scroll=graph.scrollTop,hadFocus=graph.contains(document.activeElement),filterFocused=document.activeElement?.id==='filter-graph';
+  graphFilterText=$('#filter-graph')?.value??graphFilterText;graph.replaceChildren();
+  const graphSearch=graphFilterText.trim().toLowerCase();
+  const visibleCommits=graphSearch?commits.filter(commit=>commitMatchesFilter(commit,graphSearch)):commits;
   const seeds=[];
   if(historyMode)seeds.push(...historyGraphSeeds());
   else{
@@ -256,12 +363,17 @@ function renderGraph(){
     if(summary)seeds.push({oid:'@working-tree',color:'#0969da'});
   }
   remember();
-  for(const rowData of colorGraph(layoutGraph(commits,{head:summary?.head,workingTree:!historyMode&&!!summary}),seeds)){
-    if(rowData.commit.virtual){const row=element('div','graph-row working-tree-row'+(selection.mode==='wip'?' active':''));const subject=element('div','subject working-tree-subject');subject.append(element('strong','',`Working tree · ${summary.files} files`),element('small','working-tree-branch',summary.rebase?.active?'Rebasing '+summary.rebase.branch:summary.branch==='(detached)'?'Detached head':summary.branch));row.append(graphSVG(rowData,summary?.head),subject);row.onclick=()=>choose({mode:'wip'});graph.append(row);continue;}
+  let placedGraphFilter=false;
+  for(const rowData of colorGraph(layoutGraph(visibleCommits,{head:summary?.head,workingTree:!historyMode&&!!summary}),seeds)){
+    if(rowData.commit.virtual){const row=element('div','graph-row working-tree-row'+(selection.mode==='wip'?' active':''));const subject=element('div','subject working-tree-subject');subject.append(element('strong','',`Working tree · ${summary.files} files`),element('small','working-tree-branch',summary.rebase?.active?'Rebasing '+summary.rebase.branch:summary.branch==='(detached)'?'Detached head':summary.branch));row.append(graphSVG(rowData,summary?.head),subject,makeGraphFilter());placedGraphFilter=true;row.onclick=()=>choose({mode:'wip'});graph.append(row);continue;}
     const commit=rowData.commit,row=element('div','graph-row'+(selection.mode==='commit'&&selection.ref===commit.oid?' active':'')+(selection.mode==='range'&&[selection.from,selection.to].includes(commit.oid)?' range':''));row.append(graphSVG(rowData,summary?.head));
     const subject=element('div','subject');subject.title=commit.subject+(commit.path&&commit.path!==focusPath?`\n${commit.path}`:'');
-    for(const branch of branchRows.filter(b=>b.oid===commit.oid)){const label=element('span','refs'+(branch.current?'':' other'),branch.name);if(prefs.refs.includes(branch.ref)){label.style.color=branchColor(branch);label.style.border='1px solid '+branchColor(branch);}subject.append(label);}for(const tag of tagRows.filter(tag=>tag.oid===commit.oid)){const badge=element('span','refs tag-ref',tag.name);badge.title=(tag.annotated?'Annotated tag: ':'Tag: ')+tag.name;subject.append(badge);}subject.append(document.createTextNode(commit.subject));
-    row.append(subject,element('span','hash',commit.oid.slice(0,8)),element('span','author',commit.author),element('span','date',commit.date.slice(0,10)));row.title=`${commit.oid}\n${commit.author} · ${commit.date}${commit.path?`\n${commit.path}`:''}`;
+    for(const branch of branchRows.filter(b=>b.oid===commit.oid)){const label=element('span','refs'+(branch.current?'':' other'));fillFilterHit(label,branch.name,graphSearch);if(prefs.refs.includes(branch.ref)){label.style.color=branchColor(branch);label.style.border='1px solid '+branchColor(branch);}subject.append(label);}
+    for(const tag of tagRows.filter(tag=>tag.oid===commit.oid)){const badge=element('span','refs tag-ref');fillFilterHit(badge,tag.name,graphSearch);badge.title=(tag.annotated?'Annotated tag: ':'Tag: ')+tag.name;subject.append(badge);}
+    const subjectText=element('span');fillFilterHit(subjectText,commit.subject,graphSearch);subject.append(subjectText);
+    const hash=element('span','hash');fillFilterHit(hash,commit.oid.slice(0,8),graphSearch);
+    const author=element('span','author');fillFilterHit(author,commit.author,graphSearch);
+    row.append(subject,hash,author,element('span','date',commit.date.slice(0,10)));row.title=`${commit.oid}\n${commit.author} · ${commit.date}${commit.path?`\n${commit.path}`:''}`;
     row.onclick=event=>{
       if(historyMode){choose({mode:'commit',ref:commit.oid});return;}
       if((event.shiftKey||event.ctrlKey||event.metaKey)&&['commit','range'].includes(selection.mode)){const from=selection.ref||selection.from;choose(from===commit.oid?{mode:'commit',ref:commit.oid}:{mode:'range',from,to:commit.oid});}
@@ -273,8 +385,16 @@ function renderGraph(){
       showMenu(row,[{label:'Create Branch',run:()=>createBranch(commit.oid)},{label:'Tag',disabled:busy,run:()=>tagCommit(commit.oid)},{label:'Check out',run:()=>checkoutCommit(commit.oid)},{label:`Merge into ${summary?.branch==='(detached)'?'current branch':summary?.branch}`,disabled:busy||summary?.branch==='(detached)'||summary?.merge?.active||summary?.rebase?.active||commit.oid===summary?.head,run:async()=>{const result=await action('merge',{ref:commit.oid},'Merge commit');if(result)await choose({mode:'wip'});}},{label:'Rebase onto this commit',disabled:busy||summary?.branch==='(detached)'||summary?.merge?.active||summary?.rebase?.active||commit.oid===summary?.head,run:()=>startRebase(commit.oid)},{label:'Cherry-pick',disabled:busy||summary?.branch==='(detached)'||summary?.merge?.active||summary?.rebase?.active||summary?.cherry?.active||commit.parents.length>1,run:()=>pickChanges(commit.oid)},{label:'Restore working tree from here',disabled:busy||summary?.branch==='(detached)'||summary?.merge?.active||summary?.rebase?.active,run:()=>restoreSnapshot(commit.oid)},...['soft','hard'].map(mode=>({label:mode==='soft'?'Squash since here':'Reset to here',danger:true,disabled:busy||summary?.branch==='(detached)'||summary?.merge?.active||summary?.rebase?.active,run:()=>resetCommit(commit.oid,mode)}))],commit.oid.slice(0,10));
     };graph.append(row);
   }
+  if(!placedGraphFilter){
+    const bar=element('div','graph-row working-tree-row graph-filter-bar');
+    bar.append(element('div','subject'),makeGraphFilter());
+    graph.prepend(bar);placedGraphFilter=true;
+  }
   if(!commits.length)graph.append(element('div','empty',historyMode?(summary?.head?'No commits touch this path in the selected branches.':'No commits yet.'):(summary?.head?'No graph refs selected. Check branches on the left.':'No commits yet. Stage files and create your first commit.')));
-  graph.scrollTop=scroll;if(hadFocus){const active=graph.querySelector('.graph-row.active,.graph-row.range');if(active){active.tabIndex=0;active.focus({preventScroll:true});}}
+  else if(graphSearch&&!visibleCommits.length)graph.append(element('div','empty','No matching commits.'));
+  graph.scrollTop=scroll;
+  if(filterFocused){const input=$('#filter-graph');input?.focus({preventScroll:true});const end=input?.value.length||0;input?.setSelectionRange?.(end,end);}
+  else if(hadFocus){const active=graph.querySelector('.graph-row.active,.graph-row.range');if(active){active.tabIndex=0;active.focus({preventScroll:true});}}
 }
 async function choose(next){
   if(historyMode&&next.mode==='wip')return;
@@ -286,13 +406,13 @@ async function loadFiles(){
     $('#compose-editor').hidden=true;$('#file-actions').hidden=true;$('#historical-message').hidden=false;$('#diff-kind').hidden=true;
     updateHistoryChrome();
     if(!selection.ref||!commits.some(c=>c.oid===selection.ref)){
-      fileRows=[];renderFiles();$('#selection-meta').textContent='History · '+focusPath;$('#files-title').textContent=focusPath.split('/').at(-1);
+      fileRows=[];renderFiles();setSelectionMeta('History · ',focusPath);
       renderHistoryCommit(null,commits.length?'Select a commit.':'No commits touch this path in the selected branches.');
       clearFileDiff();return;
     }
     const row=commits.find(c=>c.oid===selection.ref),path=row?.path||focusPath;
     fileRows=[{path,oldPath:row?.oldPath,code:row?.code||'M'}];
-    $('#selection-meta').textContent=`History · ${path}`;$('#files-title').textContent=path.split('/').at(-1);
+    setSelectionMeta('History · ',path);
     const message=await api(route('commit-message')+'?ref='+encodeURIComponent(selection.ref));if(rev!==viewRevision)return;
     renderHistoryCommit(row,message.message);renderFiles();
     // Keep the graph visible until the path row is clicked for a diff.
@@ -303,7 +423,10 @@ async function loadFiles(){
   const result=selection.mode==='wip'?await fetchWorking(false):await api(route('files')+'?'+q);if(rev!==viewRevision)return;const files=Array.isArray(result)?result:result.files;if(!Array.isArray(result)&&!stageQueue.running)acceptWorking(result);fileRows=files;applyStageOverrides();renderFiles();
   noteTrackedOmission(result);
   const wip=selection.mode==='wip';$('#compose-editor').hidden=!wip;$('#file-actions').hidden=!wip;$('#historical-message').hidden=wip;$('#diff-kind').hidden=!wip;
-  const label=wip?'Working tree':selection.mode==='commit'?`Commit ${selection.ref.slice(0,8)}`:selection.mode==='stash'?selection.ref:`${selection.from.slice(0,8)} → ${selection.to.slice(0,8)}`;$('#selection-meta').textContent=label;$('#files-title').textContent=label;
+  if(wip)setSelectionMeta('Working tree');
+  else if(selection.mode==='commit')setSelectionMeta('Commit ',{bold:selection.ref.slice(0,8)});
+  else if(selection.mode==='stash')setSelectionMeta(selection.ref);
+  else setSelectionMeta({bold:selection.from.slice(0,8)},' → ',{bold:selection.to.slice(0,8)});
   if(!wip){const ref=selection.ref||selection.to;const message=await api(route('commit-message')+'?ref='+encodeURIComponent(ref));if(rev===viewRevision)$('#historical-message').textContent=message.message;}
   if(activeFile&&files.some(f=>f.path===activeFile))await showDiff(activeFile,{auto:true});else clearFileDiff();
 }
@@ -325,35 +448,81 @@ function renderFiles(){
       root.append(row);
     }
     if(!files.length)root.append(element('div','empty','No path at this revision.'));
-    $('#files-title').title=files[0]?.path||focusPath;return;
+    return;
   }
   // Filters apply to WIP and to commit/range/stash views so Expand/dots match the visible selection.
   files=files.filter(filePassesFilters);
-  const search=$('#path-filter').value.toLowerCase();files=files.filter(f=>f.path.toLowerCase().includes(search));
+  const search=panelQuery('#path-filter');files=files.filter(f=>textMatches(f.path,search));
   const tree={files:[],folders:new Map()},wip=selection.mode==='wip';
   for(const file of files){const parts=file.path.split('/');let node=tree;for(const name of parts.slice(0,-1)){if(!node.folders.has(name))node.folders.set(name,{files:[],folders:new Map()});node=node.folders.get(name);}node.files.push(file);}
   summarizeFolders(tree,wip);
+  prefs.fileChainsExpanded||={};
+  function folderInteresting(prefix,status){
+    return status.changed||!!search||activeFile?.startsWith(prefix)||[...selectedFiles].some(path=>path.startsWith(prefix));
+  }
+  function appendFileMarkers(label,name,status){
+    const markers=element('span','folder-markers'),descriptions=[];
+    label.classList.toggle('has-changes',status.changed);
+    function dot(kind,description){const mark=element('span','folder-dot '+kind);mark.setAttribute('aria-hidden','true');markers.append(mark);descriptions.push(description);}
+    if(wip){
+      if(status.conflicted)dot('conflicted','Unresolved conflicts');
+      else {if(status.unstaged)dot('unstaged','Unstaged changes');if(status.staged)dot('staged','Staged changes');}
+    }else{
+      if(status.added)dot('added','Inserted files');
+      if(status.modified)dot('modified','Updated files');
+      if(status.deleted)dot('deleted','Deleted files');
+    }
+    if(markers.children.length)label.append(markers);
+    label.title=name+(descriptions.length?' · '+descriptions.join(' · '):status.changed?' · Changed files':' · No changes');
+    label.setAttribute('aria-label',label.title);
+  }
+  function makeFileFolder(prefix,label,interesting){
+    const details=element('details','folder');
+    details.open=folderPrefOpen(prefs.folders,prefix,interesting);
+    details.dataset.path=prefix;details.append(label);
+    details.addEventListener('toggle',()=>{prefs.folders[prefix]=details.open;remember();});
+    return details;
+  }
   function walk(node,container,prefix=''){
-    for(const [name,child] of [...node.folders].sort(([a],[b])=>a.localeCompare(b))){const full=prefix+name+'/',details=element('details','folder'),label=element('summary'),title=element('span','folder-name',name);
-      label.append(title);
-      const status=child.status,markers=element('span','folder-markers'),descriptions=[];
-      label.classList.toggle('has-changes',status.changed);
-      function dot(kind,description){const mark=element('span','folder-dot '+kind);mark.setAttribute('aria-hidden','true');markers.append(mark);descriptions.push(description);}
-      if(wip){
-        if(status.conflicted)dot('conflicted','Unresolved conflicts');
-        else {if(status.unstaged)dot('unstaged','Unstaged changes');if(status.staged)dot('staged','Staged changes');}
+    for(const [name,child] of [...node.folders].sort(([a],[b])=>a.localeCompare(b))){
+      const chain=collectFileChain(name,child,prefix);
+      if(chain.length>=2){
+        const runs=elisionRuns(chain,item=>fileMarkerKey(item.node.status,wip));
+        let host=container,last=chain.at(-1);
+        for(const run of runs){
+          const key=chainExpandKey(run),expanded=!!prefs.fileChainsExpanded[key];
+          const pathTitle=run.map(item=>item.name).join(' / ');
+          if(expanded||run.length<3){
+            for(const seg of run){
+              const label=element('summary');label.append(filterLabel('folder-name',seg.name,search));
+              appendFileMarkers(label,seg.name,seg.node.status);
+              const folder=makeFileFolder(seg.prefix,label,folderInteresting(seg.prefix,seg.node.status));
+              host.append(folder);host=folder;last=seg;
+            }
+          }else{
+            const first=run[0];last=run.at(-1);
+            const label=element('summary','branch-chain-summary');
+            label.append(filterLabel('folder-name',first.name,search));
+            const ellipsis=element('button','branch-chain-ellipsis','…');
+            ellipsis.type='button';ellipsis.title=`Show ${run.length-2} folders in ${pathTitle}`;
+            ellipsis.setAttribute('aria-label',ellipsis.title);
+            ellipsis.onclick=event=>{event.preventDefault();event.stopPropagation();prefs.fileChainsExpanded[key]=true;remember();renderFiles();};
+            label.append(ellipsis,filterLabel('folder-name',last.name,search));
+            appendFileMarkers(label,pathTitle,first.node.status);
+            const folder=makeFileFolder(first.prefix+'…'+last.prefix,label,folderInteresting(last.prefix,last.node.status));
+            folder.dataset.chainKey=key;
+            host.append(folder);host=folder;
+          }
+        }
+        walk(last.node,host,last.prefix);
       }else{
-        if(status.added)dot('added','Inserted files');
-        if(status.modified)dot('modified','Updated files');
-        if(status.deleted)dot('deleted','Deleted files');
+        const seg=chain[0],label=element('summary');label.append(filterLabel('folder-name',seg.name,search));
+        appendFileMarkers(label,seg.name,seg.node.status);
+        const folder=makeFileFolder(seg.prefix,label,folderInteresting(seg.prefix,seg.node.status));
+        container.append(folder);walk(seg.node,folder,seg.prefix);
       }
-      if(markers.children.length)label.append(markers);
-      label.title=name+(descriptions.length?' · '+descriptions.join(' · '):status.changed?' · Changed files':' · No changes');
-      label.setAttribute('aria-label',label.title);
-      // Default collapsed; open paths to changes, search hits, or the active / multi-selected files.
-      const interesting=status.changed||!!search||activeFile?.startsWith(full)||[...selectedFiles].some(path=>path.startsWith(full));
-      details.open=folderPrefOpen(prefs.folders,full,interesting);details.dataset.path=full;details.append(label);details.addEventListener('toggle',()=>{prefs.folders[full]=details.open;remember();});walk(child,details,full);container.append(details);}
-    for(const file of node.files.sort((a,b)=>a.path.localeCompare(b.path))){const row=element('div','file file-'+fileCategory(file)+(file.path===activeFile?' active':'')+(selectedFiles.has(file.path)?' selected':'')),name=element('button','path',file.path.split('/').at(-1));
+    }
+    for(const file of node.files.sort((a,b)=>a.path.localeCompare(b.path))){const row=element('div','file file-'+fileCategory(file)+(file.path===activeFile?' active':'')+(selectedFiles.has(file.path)?' selected':'')),name=element('button','path');fillFilterHit(name,file.path.split('/').at(-1),search);
       const renameHint=file.oldPath&&file.oldPath!==file.path?` · was ${file.oldPath}`:'';
       name.title=file.path+renameHint+' · '+fileStatus(file);row.dataset.path=file.path;row.title=name.title;name.onclick=async event=>{
       if(event.ctrlKey||event.metaKey){if(selectedFiles.has(file.path))selectedFiles.delete(file.path);else selectedFiles.add(file.path);renderFiles();feedback(`${selectedFiles.size} paths selected.`);return;}
@@ -363,7 +532,7 @@ function renderFiles(){
       if(selection.mode==='wip'&&!file.ignored){const stage=element('button','stage stage-toggle'+(file.staged?' staged':''),'s');stage.disabled=busy||(!stageOverrides.has(file.path)&&!file.staged&&!file.unstaged&&!file.untracked);stage.setAttribute('aria-pressed',String(!!file.staged));stage.title=stage.disabled?'Unchanged tracked file':file.staged&&!file.conflicted?'Unstage':'Stage';stage.setAttribute('aria-label',`${file.staged?'Unstage':'Stage'} ${file.path}`);stage.onclick=()=>queueStage([file.path],file.staged&&!file.conflicted?'unstage':'stage');row.prepend(stage);}row.onclick=event=>{if(event.target.closest('button'))return;name.dispatchEvent(new MouseEvent('click',{bubbles:true,ctrlKey:event.ctrlKey,metaKey:event.metaKey}));};row.oncontextmenu=event=>{event.preventDefault();fileMenu(file,row);};container.append(row);
     }
   }
-  walk(tree,root);if(restoreTitle){const target=[...root.querySelectorAll('.path')].find(button=>button.title===restoreTitle);target?.focus({preventScroll:true});}if(!files.length)root.append(element('div','empty','No matching files.'));$('#files-title').title=`${files.length} files · Ctrl/Cmd+click selects paths`;
+  walk(tree,root);if(restoreTitle){const target=[...root.querySelectorAll('.path')].find(button=>button.title===restoreTitle);target?.focus({preventScroll:true});}if(!files.length)root.append(element('div','empty','No matching files.'));
 }
 async function showDiff(file,{auto=false}={}){
   if(auto&&selection.mode==='wip'){const entry=fileRows.find(row=>row.path===file);if(entry?.staged&&!entry.unstaged)$('#diff-kind').value='staged';else if(entry&&!entry.staged)$('#diff-kind').value='unstaged';}
@@ -425,6 +594,15 @@ for(const category of fileFilterIds){
     else loadFiles().catch(e=>feedback(e.message,true));
   };
 }
+for(const side of ['local','remote']){
+  const check=$('#filter-branch-'+side);if(!check)continue;
+  check.checked=prefs.branchFilters?.[side]??true;
+  check.onchange=()=>{
+    prefs.branchFilters={local:$('#filter-branch-local').checked,remote:$('#filter-branch-remote').checked};
+    remember();renderBranches();
+  };
+}
+$('#filter-branches').oninput=()=>{renderBranches();renderStashes();};
 $('#path-filter').oninput=()=>{clearFileDiff();renderFiles();};
 $('#diff-kind').value=prefs.staged?'staged':'unstaged';$('#diff-kind').onchange=()=>{prefs.staged=$('#diff-kind').value==='staged';remember();if(activeFile)showDiff(activeFile).catch(e=>feedback(e.message,true));};
 function collapseTree(root,folderSelector,persist){
@@ -443,10 +621,12 @@ function expandInteresting(root,folderSelector,persist){
 }
 const persistBranchFolder=detail=>{prefs.branchFolders||={};if(detail.dataset.prefix)prefs.branchFolders[detail.dataset.prefix]=detail.open;};
 const persistFileFolder=detail=>{if(detail.dataset.path)prefs.folders[detail.dataset.path]=detail.open;};
-$('#expand-branches').onclick=()=>expandInteresting($('#branches'),'details.branch-folder',persistBranchFolder);
-$('#collapse-branches').onclick=()=>collapseTree($('#branches'),'details.branch-folder',persistBranchFolder);
-$('#expand-files').onclick=()=>expandInteresting($('#files'),'details.folder',persistFileFolder);
-$('#collapse-files').onclick=()=>collapseTree($('#files'),'details.folder',persistFileFolder);
+function resetBranchChainElision(){prefs.branchChainsExpanded={};remember();}
+function resetFileChainElision(){prefs.fileChainsExpanded={};remember();}
+$('#expand-branches').onclick=()=>{resetBranchChainElision();renderBranches();expandInteresting($('#branches'),'details.branch-folder',persistBranchFolder);};
+$('#collapse-branches').onclick=()=>{resetBranchChainElision();renderBranches();collapseTree($('#branches'),'details.branch-folder',persistBranchFolder);};
+$('#expand-files').onclick=()=>{resetFileChainElision();renderFiles();expandInteresting($('#files'),'details.folder',persistFileFolder);};
+$('#collapse-files').onclick=()=>{resetFileChainElision();renderFiles();collapseTree($('#files'),'details.folder',persistFileFolder);};
 $('#bc').onclick=async()=>{if(!activeFile)return feedback('Select a file first.');await action('bc',Object.fromEntries(new URLSearchParams({...Object.fromEntries(queryForSelection()),path:activeFile})),'Launch Beyond Compare');};
 $('#command-form').onsubmit=async event=>{event.preventDefault();const command=$('#command').value.trim();if(!command||busy)return;history.push(command);historyIndex=history.length;$('#command').value='';await action('command',{command},'Run Git command');};
 $('#command').onkeydown=event=>{if(['ArrowUp','ArrowDown'].includes(event.key)){event.preventDefault();historyIndex=Math.max(0,Math.min(history.length,historyIndex+(event.key==='ArrowUp'?-1:1)));$('#command').value=history[historyIndex]||'';}};
@@ -520,11 +700,15 @@ $('#graph').addEventListener('keydown',event=>{if((event.key==='Enter'||event.ke
 let watchTimer,watchStopped=false,watchRunning=false;
 function watchQuery(fresh=false){const q=new URLSearchParams({ignored:$('#filter-ignored').checked?'1':'0',tracked:$('#filter-tracked').checked?'1':'0'});if(fresh)q.set('fresh','1');if(activeFile&&selection.mode==='wip')q.set('path',activeFile);return q;}
 function fetchWorking(fresh){return api(route('watch')+'?'+watchQuery(fresh));}
-let trackedOmitNotice='';
 function noteTrackedOmission(data){
-  if(!data||Array.isArray(data)||!data.trackedOmitted){trackedOmitNotice='';return;}
-  const message=`Tracked list omitted (${Number(data.trackedTotal||0).toLocaleString()} files). Turn off Tracked or leave only Changed/Untracked on for large repos.`;
-  if(trackedOmitNotice===message)return;trackedOmitNotice=message;feedback(message);
+  if(!data||Array.isArray(data)||!data.trackedOmitted)return;
+  const tracked=$('#filter-tracked');
+  if(tracked?.checked){
+    tracked.checked=false;
+    prefs.fileFilters=Object.fromEntries(fileFilterIds.map(name=>[name,$('#filter-'+name).checked]));
+    remember();
+  }
+  feedback(`Too many tracked files (${Number(data.trackedTotal||0).toLocaleString()}) to list. Tracked left off — use Changed/Untracked or filter a smaller path.`,true);
 }
 function acceptWorking(data){
   workToken=data.token;activeDiffToken=data.activeToken;

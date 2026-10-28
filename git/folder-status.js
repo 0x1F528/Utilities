@@ -1,3 +1,29 @@
+/** Status-dot fingerprint for file-folder chain elision (same dots → one run). */
+export function fileMarkerKey(status={},workingTree=true){
+  if(!status)return '';
+  if(workingTree){
+    if(status.conflicted)return 'conflicted';
+    return ['unstaged','staged'].filter(key=>status[key]).join('\0');
+  }
+  return ['added','modified','deleted'].filter(key=>status[key]).join('\0');
+}
+
+/**
+ * Single-child folder chain from a named child through the tip that holds files or branches.
+ * Intermediate nodes have no files and exactly one child folder.
+ */
+export function collectFileChain(startName,startNode,parentPrefix=''){
+  const chain=[];
+  let name=startName,node=startNode,prefix=parentPrefix+startName+'/';
+  for(;;){
+    chain.push({name,prefix,node});
+    if(!node||node.files.length>0||node.folders.size!==1)break;
+    const [nextName,nextNode]=[...node.folders.entries()][0];
+    name=nextName;node=nextNode;prefix+=nextName+'/';
+  }
+  return chain;
+}
+
 // Classify a historical / name-status path as insert, update, or delete.
 export function historicalKind(file){
   const code=String(file.code||'').trim();
